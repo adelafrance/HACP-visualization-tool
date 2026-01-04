@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Mac
+.DS_Store
+
+# Local App Data
+session_state.json
+config.json
+*.log
+
+# Large Data / Archives
+archive/
+# Assuming test_data_set might be large or local-only, but verify with user if needed.
+# text_data_set/ 
