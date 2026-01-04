@@ -1,11 +1,16 @@
 # HACP Visualization Tool
 
-A specialized Streamlit application for analyzing and visualizing polarimeter data from the Hydrogen Atom Control Project (HACP). This tool processes raw measurement images to compute Stokes parameters, Mueller matrix elements, and signal decomposition metrics.
+A specialized Streamlit application for analyzing and visualizing polarimeter data from the **Hyper-Angular Cloud Polarimeter (HACP)**. This tool processes raw measurement images to compute Stokes parameters, Mueller matrix elements, and signal decomposition metrics.
 
 ## Features
 
-*   **Interactive Heatmaps**: View raw measurement images with clickable column selection.
+*   **Precise Angular Calibration**: Maps raw pixel coordinates to physical scattering angles for accurate analysis, ensuring geometrically correct signal interpretation.
 *   **Mueller Matrix Calculation**: Automatically computes S11, S12, S33, S34 and normalized elements based on loaded measurement sets.
+*   **Signal Decomposition**:
+    *   **Background Subtraction**: Removes background noise using reference images.
+    *   **Wall Subtraction**: Uses double-Gaussian fitting to separate signal from wall reflections.
+    *   **Dynamic ROI**: Automatically detects beam path and width.
+*   **Interactive Inspection**: View raw measurement images with clickable column selection for detailed profile analysis.
 *   **Signal Decomposition**:
     *   **Background Subtraction**: Removes background noise using reference images.
     *   **Wall Subtraction**: Uses double-Gaussian fitting to separate signal from wall reflections.
