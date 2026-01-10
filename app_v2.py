@@ -8,10 +8,10 @@ import json
 from collections import defaultdict
 
 from utils import pixel_angle_tool
-from utils import polarimeter_processing
-from utils import app_utils
+from utils import polarimeter_processing, app_utils, plotting
 from utils import app_computation
 from utils import app_visualization
+from utils import dashboard
 
 st.set_page_config(layout="wide", page_title="Polarimeter Analysis v2", initial_sidebar_state="expanded")
 
@@ -28,6 +28,58 @@ def load_angle_model():
 
 angle_model = load_angle_model()
 
+# --- Initialize Session State ---
+if 'comparisons' not in st.session_state:
+    st.session_state.comparisons = [] # List of comparison sets
+if 'app_mode' not in st.session_state:
+    st.session_state.app_mode = "Data Dashboard" # Default mode
+if 'iterations' not in st.session_state:
+    st.session_state.iterations = []
+if 'selected_iter_option' not in st.session_state:
+    st.session_state.selected_iter_option = "Average All"
+# --------------------------------
+
+# --- Helper: Handle Dashboard Load Request ---
+if 'target_load' in st.session_state and st.session_state.target_load:
+    tl = st.session_state.target_load
+    
+    # 1. Update Persistent Session File
+    current_state = {}
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, 'r') as f: current_state = json.load(f)
+        except: pass
+    
+    # Update fields
+    current_state['date'] = tl['date']
+    current_state['meas_parent'] = tl['meas_parent']
+    current_state['meas_seq'] = tl['meas_seq']
+    if 'meas_path' in tl: current_state['meas_path'] = tl['meas_path']
+    
+    if tl.get('bg_parent'): 
+        current_state['bg_parent'] = tl['bg_parent']
+        # Try to infer a bg_path for robustness
+        # Construct path: date_folder/bg_parent/best_match
+        try:
+             date_dir = os.path.dirname(os.path.dirname(tl['meas_path']))
+             bg_parent_dir = os.path.join(date_dir, tl['bg_parent'])
+             best_bg = app_utils.find_best_background_folder(tl['meas_seq'], tl['meas_path'], bg_parent_dir)
+             if best_bg:
+                 current_state['bg_path'] = os.path.join(bg_parent_dir, best_bg)
+        except: pass
+        
+    # Best effort bg_seq usually handled by finding logic, can leave blank or try to set if known
+    
+    with open(SESSION_FILE, 'w') as f: json.dump(current_state, f)
+    
+    # 2. Switch Mode
+    st.session_state.app_mode = "Interactive Analysis"
+    
+    # 3. Clear Request & Rerun
+    del st.session_state.target_load
+    st.rerun()
+
+# ... (Previous helper functions omitted for brevity, they remain unchanged) ...
 def go_to_previous():
     if 'iterations' in st.session_state and st.session_state.iterations:
         opts = ["Average All"] + st.session_state.iterations
@@ -47,6 +99,7 @@ def go_to_next():
                 st.session_state.selected_iter_option = opts[idx + 1]
 
 def render_signal_decomposition(img_float, key_name, col_idx, roi_paths, bit_depth):
+    # ... (function body remains identical) ...
     """Renders the signal decomposition plot for a specific column."""
     with st.container():
         with st.container():
@@ -163,22 +216,6 @@ def render_signal_decomposition(img_float, key_name, col_idx, roi_paths, bit_dep
             except Exception as e:
                 st.warning(f"Could not generate profile plot: {e}")
 
-def get_modified_colorscale(name, zero_mode):
-    """Returns a colorscale with modified zero-value color."""
-    if zero_mode == "Default": return name
-    
-    try:
-        # Try to find the color list in plotly.colors.sequential
-        c_list = getattr(plotly.colors.sequential, name, None)
-        
-        if c_list:
-            new_c = list(c_list)
-            if zero_mode == "Black": new_c[0] = "#000000"
-            elif zero_mode == "White": new_c[0] = "#ffffff"
-            return new_c
-    except: pass
-    return name
-
 @st.cache_data
 def load_cached_image(path):
     return np.array(Image.open(path))
@@ -257,54 +294,34 @@ def render_custom_image_view(sel_iter, bg_on, log_thresh, roi_paths):
                     bg_img = load_cached_image(bg_dict[k]).astype(float)
                     img_float = img_float - bg_img
                     
-                # Plot Heatmap
-                final_cmap = get_modified_colorscale(cmap_name, zero_mode)
-                # Force fix_zero to True as per previous default preference
-                z_min_val = 0 
+                    
                 
-                fig = go.Figure()
-                fig.add_trace(go.Heatmap(
-                    z=img_float, 
-                    colorscale=final_cmap, 
-                    showscale=False, 
+                    
+                z_min_val = 0
+                # Plot Heatmap using centralized plotting utility
+                fig = plotting.create_heatmap_figure(
+                    img_float,
+                    cmap_name=cmap_name,
+                    zero_mode=zero_mode,
                     zmin=z_min_val,
-                    hoverinfo='none' # Let Scatter handle hover logic
-                ))
+                    title=f"{k} Heatmap"
+                )
                 
-                # OPTIMIZATION: Use Lightweight Scatter instead of Bar
-                # A single trace with points along the middle line.
-                # Combined with hovermode='x', this captures clicks anywhere in the column vertically.
+                # Add Interaction Layers (Click Capture & ROI)
                 h, w = img_float.shape
-                fig.add_trace(go.Scatter(
-                    x=np.arange(w), 
-                    y=np.full(w, h/2), # Line through middle
-                    mode='markers',
-                    marker=dict(color='rgba(0,0,0,0)', size=1), # Invisible, tiny points
-                    hoverinfo='x', # X-coordinate only
-                    showlegend=False,
-                    name='ClickCapture'
-                ))
+                plotting.add_click_capture_trace(fig, h, w)
                 
-                # Add ROI
-                if show_roi and roi_paths and 'roi_top' in roi_paths:
-                    x_vals = np.arange(len(roi_paths['roi_top']))
-                    fig.add_trace(go.Scatter(x=x_vals, y=roi_paths['roi_top'], mode='lines', line=dict(color='#00CC96', width=1, dash='dash'), name='ROI Top', hoverinfo='skip', showlegend=False))
-                    fig.add_trace(go.Scatter(x=x_vals, y=roi_paths['roi_bottom'], mode='lines', line=dict(color='#00CC96', width=1, dash='dash'), name='ROI Bottom', hoverinfo='skip', showlegend=False))
-                    fig.add_trace(go.Scatter(x=x_vals, y=roi_paths['roi_path'], mode='lines', line=dict(color='red', width=1), name='Center', hoverinfo='skip', showlegend=False))
+                if show_roi:
+                    plotting.add_roi_traces(fig, roi_paths)
                 
                 # Add Current Position Indicator
                 fig.add_vline(x=col_idx, line_width=2, line_dash="dash", line_color="red", opacity=1.0)
 
+                # Ensure layout is set for interaction
                 fig.update_layout(
-                    title=f"{k} Heatmap",
-                    margin=dict(l=0, r=0, t=30, b=0),
-                    height=450,
-                    yaxis=dict(autorange='reversed', showticklabels=False, fixedrange=True),
-                    xaxis=dict(range=[0, img_float.shape[1]], showticklabels=False, fixedrange=True),
                     clickmode='event+select',
-                    hovermode='x', # Critical: Snap to nearest X (makes clicking robust without full bars)
-                    # dragmode='select', # REMOVED: Default to zoom/pan allows clicking points more naturally
-                    # barmode='overlay' # Not needed
+                    hovermode='x',
+                    height=450
                 )
                 
                 # Render chart and capture selection events
@@ -330,198 +347,118 @@ def render_custom_image_view(sel_iter, bg_on, log_thresh, roi_paths):
                 st.error(f"Error render image {k}: {e}")
 
 # --- Sidebar ---
-st.header("Polarimeter Analysis v2")
-st.sidebar.title("Setup")
+st.header("HACP Visualization")
+app_mode = st.sidebar.radio("App Mode", ["Data Dashboard", "Interactive Analysis", "Figure Builder"], key="app_mode")
+st.sidebar.divider()
 
-with st.sidebar.expander("1. Data Source", expanded=True):
+
+
+if app_mode == "Data Dashboard":
+    st.sidebar.title("Configuration")
     base_data_path = app_utils.load_config(CONFIG_FILE)
-    data_folder = st.text_input("Enter Data Directory Path", value=base_data_path)
+    data_folder = st.sidebar.text_input("Data Root Path", value=base_data_path)
+    if data_folder and os.path.isdir(data_folder) and data_folder != base_data_path:
+         app_utils.save_config(CONFIG_FILE, data_folder)
+    st.sidebar.info("Use the main dashboard panel to manage datasets and processing.")
+
+elif app_mode == "Interactive Analysis":
+    st.sidebar.title("Analysis Setup")
     
-    # Initialize variables to prevent NameError later
-    date_subfolders = []
-    meas_idx = 0
-    bg_idx = 0
-    date_path = ""
-
-    if data_folder and os.path.isdir(data_folder):
-        if data_folder != base_data_path: app_utils.save_config(CONFIG_FILE, data_folder)
+    # 1. Recover State
+    base_data_path = app_utils.load_config(CONFIG_FILE)
+    p_state = {}
+    if os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, 'r') as f: p_state = json.load(f)
+        except: pass
         
-        # Load persistent state
-        p_state = {}
-        if os.path.exists(SESSION_FILE):
-            try:
-                with open(SESSION_FILE, 'r') as f: p_state = json.load(f)
-            except: pass
-
-        date_folders = sorted([d for d in os.listdir(data_folder) if os.path.isdir(os.path.join(data_folder, d))])
-        if date_folders:
-            d_idx = date_folders.index(p_state['date']) if p_state.get('date') in date_folders else 0
-            selected_date = st.selectbox("Select Date Folder", date_folders, index=d_idx)
-            date_path = os.path.join(data_folder, selected_date)
-            date_subfolders = sorted([d for d in os.listdir(date_path) if os.path.isdir(os.path.join(date_path, d))])
-            if date_subfolders:
-                meas_idx = date_subfolders.index("measurements") if "measurements" in date_subfolders else 0
-                if p_state.get('meas_parent') in date_subfolders: meas_idx = date_subfolders.index(p_state['meas_parent'])
-                meas_parent = st.selectbox("Select Measurement Folder", date_subfolders, index=meas_idx)
-                meas_parent_path = os.path.join(date_path, meas_parent)
-                meas_seqs = sorted([d for d in os.listdir(meas_parent_path) if os.path.isdir(os.path.join(meas_parent_path, d))])
-                
-                if meas_seqs:
-                    def_seq_idx = meas_seqs.index(min(meas_seqs, key=len))
-                    if p_state.get('meas_seq') in meas_seqs: def_seq_idx = meas_seqs.index(p_state['meas_seq'])
-                    sel_meas_seq = st.selectbox("Select Measurement Sequence", meas_seqs, index=def_seq_idx)
-                    meas_path = os.path.join(meas_parent_path, sel_meas_seq)
-                    st.session_state.current_meas_path = meas_path
-                    
-                    seq_lower = sel_meas_seq.lower()
-                    if "depol" in seq_lower: st.session_state.analysis_type = "Depolarization Ratio"
-                    elif "matrix" in seq_lower or "mueller" in seq_lower: st.session_state.analysis_type = "Mueller Matrix"
-                    
-                    bg_idx = date_subfolders.index("background_laser") if "background_laser" in date_subfolders else 0
-                    if p_state.get('bg_parent') in date_subfolders: bg_idx = date_subfolders.index(p_state['bg_parent'])
-                    bg_parent = st.selectbox("Select Background Folder", date_subfolders, index=bg_idx)
-                    bg_parent_path = os.path.join(date_path, bg_parent)
-                    bg_seqs = sorted([d for d in os.listdir(bg_parent_path) if os.path.isdir(os.path.join(bg_parent_path, d))])
-                    
-                    if bg_seqs:
-                        best_bg = app_utils.find_best_background_folder(sel_meas_seq, meas_path, bg_parent_path)
-                        bg_seq_idx = bg_seqs.index(best_bg) if best_bg in bg_seqs else 0
-                        if p_state.get('bg_seq') in bg_seqs: bg_seq_idx = bg_seqs.index(p_state['bg_seq'])
-                        sel_bg_seq = st.selectbox("Select Background Sequence", bg_seqs, index=bg_seq_idx)
-                        bg_path = os.path.join(bg_parent_path, sel_bg_seq)
-                        
-                        # Save State
-                        new_state = {'date': selected_date, 'meas_parent': meas_parent, 'meas_seq': sel_meas_seq, 'bg_parent': bg_parent, 'bg_seq': sel_bg_seq}
-                        if new_state != p_state:
-                            try:
-                                with open(SESSION_FILE, 'w') as f: json.dump(new_state, f)
-                            except: pass
-                        
-                        scan_key = f"{meas_path}_{bg_path}"
-                        if st.session_state.get('last_scan_key') != scan_key:
-                            with st.spinner("Scanning..."):
-                                m, b, err = polarimeter_processing.find_and_organize_files(meas_path, bg_path)
-                                if err or not m: m, b, err = app_utils.robust_find_and_organize_files(meas_path, bg_path)
-                                st.session_state.measurements, st.session_state.backgrounds = m, b
-                                st.session_state.iterations = sorted(m.keys()) if m else []
-                                st.session_state.last_scan_key = scan_key
-                                if st.session_state.iterations:
-                                    st.session_state.selected_iter_option = st.session_state.iterations[0]
-                                    # Auto-detect type
-                                    first_keys = set(m[st.session_state.iterations[0]].keys())
-                                    if not {'I_PP', 'I_PM', 'I_RP', 'I_RM', 'I_PL', 'I_PR'}.isdisjoint(first_keys):
-                                        st.session_state.analysis_type = "Mueller Matrix"
-                                    elif {'Depol_Parallel', 'Depol_Cross'}.issubset(first_keys):
-                                        st.session_state.analysis_type = "Depolarization Ratio"
-                        
-                         # OPTIMIZATION: Only load precomputed data if path changed
-                        if st.session_state.get('loaded_meas_path') != meas_path:
-                            # Default to standard on first load, or auto
-                            load_mode = "dynamic" if st.session_state.get('subtract_wall', False) else "standard"
-                            pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
-                            
-                            if pre_data and pre_meta.get('analysis_type') == st.session_state.get('analysis_type', ''):
-                                valid_keys = set(str(i) for i in st.session_state.iterations)
-                                filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys}
-                                st.session_state.precomputed_data = filtered_pre
-                                st.session_state.precomputed_fmt = pre_fmt
-                            else:
-                                st.session_state.precomputed_data = None
-                            st.session_state.loaded_meas_path = meas_path
-
-                        if st.session_state.get('precomputed_data'):
-                            fmt = st.session_state.get('precomputed_fmt', 'Data')
-                            st.success(f"Loaded {fmt}: {len(st.session_state.precomputed_data)} / {len(st.session_state.iterations)} steps.")
-                            st.session_state.use_precomputed = st.checkbox("Use pre-computed results", value=True)
-
-st.sidebar.header("2. Analysis Type")
-analysis_type = st.sidebar.selectbox("Analysis Type", ["Mueller Matrix", "Depolarization Ratio"], key="analysis_type")
-
-with st.sidebar.expander("3. Comparison Sources"):
-    if 'comparisons' not in st.session_state: st.session_state.comparisons = []
-    if st.button("Add Comparison"):
-        new_id = max([c['id'] for c in st.session_state.comparisons] + [0]) + 1
-        st.session_state.comparisons.append({'id': new_id, 'name': f"Comp {new_id}"})
+    # 2. Check for Active Dataset (from Dashboard or Persistence)
+    active_meas_path = p_state.get('meas_path')
+    active_bg_path = p_state.get('bg_path')
     
-    to_remove = []
-    for idx, comp in enumerate(st.session_state.comparisons):
-        st.markdown(f"**Comparison #{idx+1}**")
+    # If we have a target_load request that hasn't been processed into persistence fully?
+    # The top-level target_load handler (already implemented) updates SESSION_FILE.
+    
+    if active_meas_path and os.path.exists(active_meas_path):
+        st.session_state.current_meas_path = active_meas_path
+        st.sidebar.success(f"Loaded: `{os.path.basename(active_meas_path)}`")
         
-        # Only show controls if we have valid folders
-        if not date_subfolders:
-            st.warning("Configure Data Source first.")
-            continue
-            
-        c_mp = st.selectbox(f"Meas. Folder #{idx+1}", date_subfolders, index=meas_idx, key=f"cmp_mp_{comp['id']}")
-        c_mp_path = os.path.join(date_path, c_mp)
-        c_seqs = sorted([d for d in os.listdir(c_mp_path) if os.path.isdir(os.path.join(c_mp_path, d))])
-        if c_seqs:
-            c_ms = st.selectbox(f"Sequence #{idx+1}", c_seqs, key=f"cmp_ms_{comp['id']}")
-            c_m_path = os.path.join(c_mp_path, c_ms)
-            comp['name'] = f"Comp {idx+1}"
-            
-            c_bp = st.selectbox(f"Bg. Folder #{idx+1}", date_subfolders, index=bg_idx, key=f"cmp_bp_{comp['id']}")
-            c_bp_path = os.path.join(date_path, c_bp)
-            best_bg = app_utils.find_best_background_folder(c_ms, c_m_path, c_bp_path)
-            c_b_seqs = sorted([d for d in os.listdir(c_bp_path) if os.path.isdir(os.path.join(c_bp_path, d))])
-            if c_b_seqs:
-                def_bg_idx = c_b_seqs.index(best_bg) if best_bg in c_b_seqs else 0
-                c_bs = st.selectbox(f"Bg. Sequence #{idx+1}", c_b_seqs, index=def_bg_idx, key=f"cmp_bs_{comp['id']}")
-                c_b_path = os.path.join(c_bp_path, c_bs)
+        # 3. Load Data Logic (Headless)
+        # We need to run this to ensure st.session_state.measurements is populated
+        scan_key = f"{active_meas_path}_{active_bg_path}"
+        if st.session_state.get('last_scan_key') != scan_key:
+            with st.spinner("Loading measurement data..."):
+                m, b, err = polarimeter_processing.find_and_organize_files(active_meas_path, active_bg_path)
+                if err or not m: m, b, err = app_utils.robust_find_and_organize_files(active_meas_path, active_bg_path)
                 
-                scan_key = f"COMP_{comp['id']}_{c_m_path}_{c_b_path}"
-                if comp.get('scan_key') != scan_key:
-                    cm, cb, err = polarimeter_processing.find_and_organize_files(c_m_path, c_b_path)
-                    if err or not cm: cm, cb, err = app_utils.robust_find_and_organize_files(c_m_path, c_b_path)
-                    pre, _, fmt = app_utils.try_load_precomputed(c_m_path, LOCAL_CACHE_ROOT)
-                    comp.update({'measurements': cm, 'backgrounds': cb, 'scan_key': scan_key, 'precomputed_data': pre})
-                    if pre: st.info(f"Loaded {fmt}: {len(pre)} steps")
-        
-        c_col1, c_col2 = st.columns([0.6, 0.4])
-        if c_col1.button(f"Remove #{idx+1}", key=f"rm_{comp['id']}"): to_remove.append(idx)
-        if c_col2.button("Reload", key=f"reload_{comp['id']}", help="Reload data from disk"):
-            pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(c_meas_path, LOCAL_CACHE_ROOT)
-            comp['precomputed_data'] = pre_data
-            if pre_data: st.toast(f"Reloaded {pre_fmt} for Comp #{idx+1}")
-        st.divider()
-    for i in sorted(to_remove, reverse=True): del st.session_state.comparisons[i]
+                if m:
+                    st.session_state.measurements, st.session_state.backgrounds = m, b
+                    st.session_state.iterations = sorted(m.keys())
+                    st.session_state.last_scan_key = scan_key
+                    if st.session_state.iterations:
+                        st.session_state.selected_iter_option = st.session_state.iterations[0]
+                        # Auto-detect type
+                        first_keys = set(m[st.session_state.iterations[0]].keys())
+                        if not {'I_PP', 'I_PM', 'I_RP', 'I_RM', 'I_PL', 'I_PR'}.isdisjoint(first_keys):
+                            st.session_state.analysis_type = "Mueller Matrix"
+                        elif {'Depol_Parallel', 'Depol_Cross'}.issubset(first_keys):
+                            st.session_state.analysis_type = "Depolarization Ratio"
+                else:
+                    st.error(f"Failed to load data: {err}")
 
-with st.sidebar.expander("4. Data Export"):
-    export_fmt = st.radio("Format", ["NetCDF", "JSON"] if app_utils.HAS_XARRAY else ["JSON"], horizontal=True)
-    if st.button("Batch Process All Remaining"):
-        if 'measurements' in st.session_state:
-            bg_on = st.session_state.get('bg_toggle', True)
-            n_sigma = st.session_state.get('noise_sigma', 3.0)
-            l_thresh = st.session_state.get('log_thresh', 0.6)
-            path, data = app_computation.run_batch_process(st.session_state.measurements, st.session_state.backgrounds, st.session_state.iterations, st.session_state.get('precomputed_data'), analysis_type, bg_on, n_sigma, l_thresh, st.session_state.current_meas_path, angle_model, LOCAL_CACHE_ROOT, export_fmt, subtract_wall=st.session_state.get('subtract_wall', False))
-            st.session_state.precomputed_data = data
-            st.session_state.use_precomputed = True
-            st.success(f"Saved to: {path}")
-            
-    if st.button("Force Reprocess All Data", help="Re-calculates all iterations from scratch and overwrites the saved file."):
-        if 'measurements' in st.session_state and st.session_state.measurements and 'current_meas_path' in st.session_state:
-            # Gather parameters from session state (defaulting if not yet set)
-            bg_on = st.session_state.get('bg_toggle', True)
-            n_sigma = st.session_state.get('noise_sigma', 3.0)
-            l_thresh = st.session_state.get('log_thresh', 0.6)
-            
-            # Pass empty dict to force recalculation of all steps
-            save_path, updated_data = app_computation.run_batch_process(
-                st.session_state.measurements, st.session_state.backgrounds, st.session_state.iterations, 
-                {}, analysis_type, bg_on, n_sigma, l_thresh, st.session_state.current_meas_path, angle_model, LOCAL_CACHE_ROOT, export_fmt, subtract_wall=st.session_state.get('subtract_wall', False)
-            )
-            st.session_state.precomputed_data = updated_data
-            
-            st.sidebar.success(f"All data reprocessed and saved to: {save_path}")
-            st.session_state.use_precomputed = True 
-        else:
-            st.sidebar.warning("No data loaded to export.")
+        # 4. Load Precomputed Data (Dynamic/Standard)
+        if st.session_state.get('loaded_meas_path') != active_meas_path:
+             # Default to standard on first load, or auto
+             load_mode = "dynamic" if st.session_state.get('subtract_wall', False) else "standard"
+             pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
+             
+             if pre_data: # and pre_meta.get('analysis_type') == st.session_state.get('analysis_type', ''):
+                 # Loose check on analysis type to allow viewing
+                 valid_keys = set(str(i) for i in st.session_state.iterations)
+                 filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys}
+                 st.session_state.precomputed_data = filtered_pre
+                 st.session_state.precomputed_fmt = pre_fmt
+                 st.session_state.analysis_type = pre_meta.get('analysis_type', st.session_state.get('analysis_type', 'Mueller Matrix'))
+             else:
+                 st.session_state.precomputed_data = None
+             st.session_state.loaded_meas_path = active_meas_path
 
-    if st.button("Clear Calculation Cache", help="Clears the disk cache. Use this if you suspect calculations are outdated."):
-        st.cache_data.clear()
-        st.success("Cache cleared! Please re-run the analysis.")
+        if st.session_state.get('precomputed_data'):
+            fmt = st.session_state.get('precomputed_fmt', 'Data')
+            st.success(f"Pre-computed: {len(st.session_state.precomputed_data)} steps")
+            st.session_state.use_precomputed = st.checkbox("Use pre-computed results", value=True)
 
+        if st.sidebar.button("Change Dataset", icon="🔄"):
+            st.session_state.app_mode = "Data Dashboard"
+            st.rerun()
+
+    else:
+        st.sidebar.warning("No dataset loaded.")
+        if st.sidebar.button("Go to Dashboard"):
+            st.session_state.app_mode = "Data Dashboard"
+            st.rerun()
+
+    # Analysis Type Override
+    st.sidebar.divider()
+    curr_type = st.session_state.get('analysis_type', 'Mueller Matrix')
+    st.sidebar.selectbox("Analysis Type", ["Mueller Matrix", "Depolarization Ratio"], index=0 if curr_type == "Mueller Matrix" else 1, key="analysis_type")
+
+    # Comparisons (Simplified for now - can re-enable full scan if needed)
+    with st.sidebar.expander("Comparisons"):
+        st.info("To add comparisons, please ensure the Data Root Path is set correctly.")
+        # Logic to scan folders for comparison addition could go here if requested.
+        pass
+    
 # --- Main Panel ---
+if app_mode == "Data Dashboard":
+    dashboard.render_dashboard(base_data_path, LOCAL_CACHE_ROOT)
+    st.stop()
+
+if app_mode == "Figure Builder":
+    from utils import figure_composer
+    figure_composer.render_figure_composer(st.session_state.measurements)
+    st.stop()
+
 if 'iterations' in st.session_state and st.session_state.iterations:
     controls = st.container(border=True)
     
@@ -575,6 +512,10 @@ if 'iterations' in st.session_state and st.session_state.iterations:
 
     # --- Calculation ---
     final_results, curves_to_show, roi_paths_to_show = {}, {}, {}
+    
+    # Ensure analysis_type is defined
+    analysis_type = st.session_state.get('analysis_type', "Mueller Matrix")
+    
     req_meas = app_utils.get_required_measurements(st.session_state.measurements, analysis_type)
     
     # 1. Try Precomputed
@@ -584,7 +525,6 @@ if 'iterations' in st.session_state and st.session_state.iterations:
             all_res = defaultdict(list)
             for d in pre.values():
                 for k, v in d.items(): all_res[k].append(v)
-            for k, v in all_res.items(): final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
 
     # 2. Calculate if missing
     if not final_results:

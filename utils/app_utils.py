@@ -14,6 +14,16 @@ try:
 except ImportError:
     HAS_XARRAY = False
 
+from utils import pixel_angle_tool
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CALIBRATION_FILE_PATH = os.path.join(SCRIPT_DIR, "angle_model_data.npz")
+
+
+def load_angle_model_from_npz(path):
+    return pixel_angle_tool.load_angle_model_from_npz(path)
+
 STRATEGIES = {"Strategy A": ['I_PV', 'I_PH', 'I_PP', 'I_PM', 'I_RP', 'I_RM'], "Strategy B": ['I_PV', 'I_PH', 'I_PP', 'I_PM', 'I_PL', 'I_PR']}
 
 class NumpyEncoder(json.JSONEncoder):
@@ -57,6 +67,27 @@ def get_folder_states(folder_path):
         m = pattern.search(f)
         if m: states.add(tuple(int(x) for x in m.groups()))
     return states
+
+def count_iterations(folder_path):
+    """
+    Counts the number of unique iterations in a measurement folder.
+    Assumes filenames contain 'IterationX'.
+    """
+    if not os.path.exists(folder_path): return 0
+    try:
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.tif', '.tiff', '.bmp'))]
+    except OSError: return 0
+    
+    iterations = set()
+    for f in files:
+        m = re.search(r"Iteration(\d+)", f, re.IGNORECASE)
+        if m:
+            iterations.add(int(m.group(1)))
+        else:
+            # If no iteration tag, assume Iteration 1 (or 0?) - usually 1 based on other code
+            iterations.add(1)
+            
+    return len(iterations)
 
 def find_best_background_folder(meas_name, meas_path, bg_parent_path):
     if not os.path.exists(bg_parent_path): return None
@@ -180,7 +211,15 @@ def try_load_precomputed(meas_path, local_cache_root=None, mode="auto"):
             try:
                 if fmt == "NetCDF":
                     ds = xr.open_dataset(path)
-                    meta = ds.attrs
+                    meta = dict(ds.attrs)
+                    # Deserialize JSON strings in metadata
+                    for k, v in meta.items():
+                        if isinstance(v, str):
+                            try:
+                                meta[k] = json.loads(v)
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                                
                     data = defaultdict(dict)
                     iters = ds.coords['iteration'].values
                     for key in ds.data_vars:
@@ -188,6 +227,8 @@ def try_load_precomputed(meas_path, local_cache_root=None, mode="auto"):
                         vals = ds[key].values
                         for i, it in enumerate(iters):
                             data[str(it)][orig_key] = vals[i]
+                    # Ensure ds is closed
+                    ds.close()
                     return data, meta, "NetCDF"
                 elif fmt == "JSON":
                     with open(path, 'r') as f: d = json.load(f)
