@@ -45,10 +45,10 @@ def find_and_organize_files(measurement_folder, background_folder):
                 else: mandatory_found = False; break
             
             if mandatory_found:
-                iter_match = OPTIONAL_PATTERNS['iter'].search(search_string)
                 iteration = int(iter_match.group(1)) if iter_match else 1
-                emitter_key = (params['ep'], params['ew'])
-                receiver_key = (params['rp'], params['rw'])
+                # Normalize angles to [0, 180) for symmetry matching
+                emitter_key = (params['ep'] % 180, params['ew'] % 180)
+                receiver_key = (params['rp'] % 180, params['rw'] % 180)
                 measurement_type = MEASUREMENT_MAP.get((emitter_key, receiver_key))
                 if measurement_type:
                     filepath = os.path.join(measurement_folder, filename)

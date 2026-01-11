@@ -33,13 +33,16 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.ndarray): return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
-def save_config(config_file, path):
-    with open(config_file, 'w') as f: json.dump({'last_path': path}, f)
+def save_config(config_file, config_dict):
+    with open(config_file, 'w') as f:
+        json.dump(config_dict, f, indent=4)
 
 def load_config(config_file):
     try:
-        with open(config_file, 'r') as f: return json.load(f).get('last_path', '')
-    except (FileNotFoundError, json.JSONDecodeError): return ''
+        with open(config_file, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 def get_required_measurements(measurements_data, analysis_type):
     if analysis_type == "Depolarization Ratio":
@@ -241,6 +244,121 @@ def try_load_precomputed(meas_path, local_cache_root=None, mode="auto"):
                 print(f"{fmt} load failed for {path}: {e}")
                 continue
     return None, {}, None
+
+def translate_sequence_name(seq_name):
+    """
+    Translates a cryptic sequence name into a human-readable description.
+    Order: Type | Test | Symmetry | WS
+    """
+    desc_parts = []
+    
+    # 1. Measurement Type (e.g. Matrix or Depol)
+    if "steps1to6" in seq_name: desc_parts.append("Matrix")
+    elif "steps7to8" in seq_name: desc_parts.append("Depol")
+    
+    # 2. Base Tests (e.g. Base or VarA)
+    if "test_01A" in seq_name: desc_parts.append("VarA")
+    elif "test_01" in seq_name: desc_parts.append("Base")
+    
+    # 3. Symmetries (e.g. RecEmitSym)
+    if "RS-ES" in seq_name: desc_parts.append("RecEmitSym")
+    elif "RS" in seq_name: desc_parts.append("RecSym")
+    elif "ES" in seq_name: desc_parts.append("EmitSym")
+    else: desc_parts.append("--") # Default placeholder for no symmetry
+    
+    # 4. Wind Speed (e.g. WS1.14)
+    import re
+    ws_match = re.search(r"WS-(\d+_\d+)ms", seq_name)
+    if ws_match:
+        val = ws_match.group(1).replace("_", ".")
+        desc_parts.append(f"WS{val}")
+    elif "WS-2_1ms" in seq_name or "WS-2.1ms" in seq_name:
+         desc_parts.append("WS2.1")
+
+    if not any(p != "--" for p in desc_parts):
+        return seq_name # Fallback if we couldn't translate anything meaningful
+        
+    return " | ".join(desc_parts)
+
+def get_analysis_type_from_sequence(seq_name):
+    """Returns 'Mueller Matrix' or 'Depolarization Ratio' based on sequence keywords."""
+    if not seq_name: return "Mueller Matrix"
+    seq_lower = seq_name.lower()
+    # Check for Depolarization Ratio indicators
+    if "steps7to8" in seq_lower: return "Depolarization Ratio"
+    if "ep0_ew0" in seq_lower or "ep180_ew180" in seq_lower: return "Depolarization Ratio"
+    if "ep90_ew90" in seq_lower or "ep270_ew270" in seq_lower: return "Depolarization Ratio"
+    
+    # Check for Mueller Matrix indicators
+    if "steps1to6" in seq_lower: return "Mueller Matrix"
+    
+    return "Mueller Matrix" # Default
+
+def translate_bg_folder(folder_name):
+    """Translates background parent folders to LaserON/OFF."""
+    if "nolaser" in folder_name.lower(): return "LaserOFF"
+    if "laser" in folder_name.lower(): return "LaserON"
+    return folder_name
+
+def translate_full_path(path_str):
+    """
+    Translates a path like 'folder/sequence' into 'TranslatedFolder | TranslatedSeq'
+    """
+    if not path_str or "/" not in path_str:
+        return translate_sequence_name(path_str)
+        
+    parts = path_str.split("/")
+    # If it's more than 2, join the rest as sequence
+    folder = parts[0]
+    seq = "/".join(parts[1:])
+    
+    folder_desc = translate_bg_folder(folder)
+    seq_desc = translate_sequence_name(seq)
+    
+    return f"{folder_desc} | {seq_desc}"
+
+def scan_local_cache(local_cache_root):
+    """
+    Scans the local cache for preprocessed datasets.
+    Standard: cache_root / date_name / 'preprocessed_data' / seq_name / processed_data.nc
+    Also supports flatter structures for robustness.
+    Returns a list of dicts: [{'Date': ..., 'Sequence': ..., 'LocalPath': ...}]
+    """
+    results = []
+    if not local_cache_root or not os.path.exists(local_cache_root):
+        return results
+
+    try:
+        # Walk the directory to find any folder containing 'processed_data'
+        for root, dirs, files in os.walk(local_cache_root):
+            if any(f.startswith("processed_data") for f in files):
+                # Found a dataset folder
+                seq_name = os.path.basename(root)
+                
+                # Try to infer date from parent structure
+                # Expected: ... / Date / preprocessed_data / Sequence
+                parent = os.path.dirname(root)
+                if os.path.basename(parent) == "preprocessed_data":
+                    date_name = os.path.basename(os.path.dirname(parent))
+                else:
+                    # Fallback to parent folder or unknown
+                    date_name = os.path.basename(parent) or "Unknown"
+
+                # Avoid duplicates
+                if not any(r['LocalPath'] == root for r in results):
+                    results.append({
+                        "Date": date_name,
+                        "Sequence": seq_name,
+                        "LocalPath": root
+                    })
+                    
+        # Sort by Date descending, then Sequence
+        results.sort(key=lambda x: (x['Date'], x['Sequence']), reverse=True)
+        
+    except Exception as e:
+        print(f"Error scanning local cache: {e}")
+    
+    return results
 
 def save_precomputed_data(meas_path, data, metadata, fmt="NetCDF", local_cache_root=None, is_dynamic=False):
     string_keyed_data = {str(k): v for k, v in data.items()}

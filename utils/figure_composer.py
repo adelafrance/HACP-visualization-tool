@@ -9,10 +9,333 @@ from utils import plotting, app_computation, app_utils, polarimeter_processing
 import numpy as np
 from PIL import Image
 
-def render_figure_composer(measurements):
+# Constants
+PIXEL_OFFSET_X = 520
+
+
+def generate_composite_figure(fig_specs, layout_type, width, height, unit, check_dependencies=None, 
+                            common_labels=False, global_xlabel="", global_ylabel="", 
+                            active_style=None, colors=None, primary_label="Primary", comp_label="Comparison",
+                            show_legend=False, legend_loc="best", disable_sci_angle=False, disable_sci_y=False,
+                            angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False):
     """
-    Renders the Figure Composer Interface.
+    Generates a matplotlib figure based on the provided specifications.
+    Decoupled from Streamlit for use in optimization scripts.
+    
+    check_dependencies: dict containing 'measurements', 'backgrounds', 'comp_measurements', 'comp_backgrounds', 
+                       'precomputed_data', 'comp_precomputed_data', 'active_dataset_type'
     """
+    if check_dependencies is None: check_dependencies = {}
+    measurements = check_dependencies.get('measurements')
+    backgrounds = check_dependencies.get('backgrounds')
+    
+    # Dimensions
+    if unit == "px":
+            final_w, final_h = width / 100.0, height / 100.0 # Convert px to inches for matplotlib
+    else:
+            final_w, final_h = width, height
+
+    plt.close('all')
+    fig = plt.figure(figsize=(final_w, final_h))
+    
+    # Spacing
+    if common_labels: fig.subplots_adjust(wspace=0.25, hspace=0.05)
+    else: fig.subplots_adjust(wspace=0.35, hspace=0.35)
+
+    rows = 2 if "2x" in layout_type or "1x2" in layout_type else 1
+    cols = 2 if "2x2" in layout_type or "2x1" in layout_type else 1
+
+    # Define helper internally to close over dependencies
+    def get_series_data(t_iters, t_meas, t_bg, t_ana_type, t_var):
+        t_curves = []
+        t_x = None
+        
+        # MEANINGFUL DIFF: In the app, we fall back to st.session_state.iterations.
+        # Here, we must rely on what's passed in t_meas or check_dependencies.
+        fallback_iters = check_dependencies.get('iterations', [])
+        actual_iters = t_iters if t_iters else (list(t_meas.keys()) if t_meas else fallback_iters)
+        
+        if not actual_iters: return None, None, None
+        
+        for it in actual_iters:
+            iter_res = None
+            # Case 1: Primary data - check precomputed cache
+            # We check if the PASSED measurements object matches the PRIMARY one
+            is_primary = (t_meas is measurements)
+            
+            if is_primary and check_dependencies.get('precomputed_data'):
+                    cached = check_dependencies['precomputed_data'].get(str(it))
+                    if cached: iter_res = cached
+            
+            # Case 2: Comparison data
+            if iter_res is None and not is_primary and check_dependencies.get('comp_precomputed_data'):
+                iter_res = check_dependencies['comp_precomputed_data'].get(str(it))
+
+            # Case 3: Raw data available - compute
+            if iter_res is None and t_meas and it in t_meas:
+                req = app_utils.get_required_measurements({it: t_meas[it]}, t_ana_type)
+                try:
+                    # We might not have 'angle_model' here if it wasn't passed, handle gracefully?
+                    # It is passed as argument to parent function.
+                    calc_res, _ = app_computation.calculate_curves_for_iteration(
+                        it, t_meas, t_bg, req, t_ana_type, 
+                        True, 3.0, 1e-4, angle_model
+                    )
+                    if calc_res: iter_res = calc_res
+                except Exception as e:
+                    print(f"Error computing iteration {it}: {e}")
+            
+            if not iter_res: continue
+            
+            y_val = None
+            # Calculate derived vars if needed
+            mm_elems = polarimeter_processing.calculate_mueller_elements(iter_res)
+            
+            # Support aliases for Depolarization Ratio calculation
+            if t_var in iter_res: y_val = iter_res[t_var]
+            elif t_var == "Depolarization Ratio":
+                p_key = 'Depol_Parallel' if 'Depol_Parallel' in iter_res else 'Parallel'
+                c_key = 'Depol_Cross' if 'Depol_Cross' in iter_res else 'Cross'
+                if p_key in iter_res and c_key in iter_res:
+                    y_val = (iter_res[c_key]+1e-9)/(iter_res[p_key]+1e-9)
+            elif mm_elems and t_var in mm_elems: y_val = mm_elems[t_var]
+            
+            if y_val is not None:
+                # Re-map X to Angle if model exists
+                if t_x is None:
+                    if angle_model:
+                        t_x = angle_model(np.arange(len(y_val)) + pixel_offset)
+                    else:
+                        t_x = np.arange(len(y_val))
+                t_curves.append(y_val)
+        
+        if not t_curves or t_x is None: return None, None, None
+        
+        # Stack and calculate mean/std
+        stack = np.vstack(t_curves) # (N_iter, N_pixels)
+        mean_curve = np.mean(stack, axis=0)
+        std_curve = np.std(stack, axis=0) if len(t_curves) > 1 else None
+        
+        # Filter by Angle Range
+        if angle_range:
+            mask = (t_x >= angle_range[0]) & (t_x <= angle_range[1])
+            return t_x[mask], mean_curve[mask], std_curve[mask] if std_curve is not None else None
+        else:
+            return t_x, mean_curve, std_curve
+
+    for (r, c), spec in fig_specs.items():
+        idx = (r-1)*cols + c
+        ax = fig.add_subplot(rows, cols, idx)
+        
+        show_y = True 
+        show_x = (r == rows) or (not common_labels)
+        
+        panel_xlabel = spec.get("xlabel", global_xlabel) if show_x else ""
+        panel_ylabel = spec.get("ylabel", global_ylabel) if show_y else ""
+
+        try:
+            if spec["type"] == "Raw Image":
+                img = np.array(Image.open(spec["file"])) # (H, W)
+                x_pixel_min, x_pixel_max = 0, img.shape[1]
+                if angle_model and angle_range:
+                    all_angles = angle_model(np.arange(img.shape[1]))
+                    valid_mask = (all_angles >= angle_range[0]) & (all_angles <= angle_range[1])
+                    if np.any(valid_mask):
+                            valid_indices = np.where(valid_mask)[0]
+                            x_pixel_min, x_pixel_max = valid_indices[0], valid_indices[-1]
+                            img = img[:, x_pixel_min:x_pixel_max+1]
+                
+                plotting.create_mpl_heatmap(
+                    img, ax, cmap='viridis', 
+                    title=f"({r},{c})", 
+                    xlabel=panel_xlabel, ylabel=panel_ylabel,
+                    show_x=show_x, show_y=show_y,
+                    style=active_style
+                )
+
+            elif spec["type"] == "Signal Decomposition":
+                    img = np.array(Image.open(spec["file"])).astype(float)
+                    col_idx = int(spec['col_idx'])
+                    if col_idx < 0 or col_idx >= img.shape[1]: continue
+                    norm_profile = img[:, col_idx]
+                    y_pixels = np.arange(len(norm_profile))
+                    popt = polarimeter_processing.fit_double_gaussian_params(y_pixels, norm_profile)
+                    
+                    plotting.create_mpl_decomposition(
+                    y_pixels, norm_profile, ax, popt=popt,
+                    xlabel=panel_xlabel, ylabel=panel_ylabel,
+                    show_x=show_x, show_y=show_y,
+                    style=active_style
+                    )
+
+            elif spec["type"] == "Computed Data":
+                # Determine Analysis Type
+                ana_type = check_dependencies.get('active_dataset_type', "Mueller Matrix")
+                
+                # Heuristic override
+                if spec['iters'] and measurements:
+                    first_iter_keys = list(measurements[spec['iters'][0]].keys())
+                    if "Depolarization Ratio" == spec["variable"] and 'Depol_Parallel' in first_iter_keys:
+                        ana_type = "Depolarization Ratio"
+
+                x_p, y_p, std_p = get_series_data(spec['iters'], measurements, backgrounds, ana_type, spec['variable'])
+                
+                # Smart Scaling: Collect mean curves to determine Y-range
+                means_to_scale = []
+                s_factor = spec.get("scale_factor", 1.0)
+                int_label = spec.get("panel_title") # Use panel_title as internal label
+
+                if y_p is not None: means_to_scale.append(y_p * s_factor)
+
+                # Comparison(s)
+                comparison_runs = [] # List of (x, y, std, label, color)
+                
+                # Handling for legacy single comparison
+                if spec.get("show_comp") and check_dependencies.get('comp_measurements'):
+                     c_meas = check_dependencies['comp_measurements']
+                     c_bg = check_dependencies.get('comp_backgrounds', {})
+                     c_iters = check_dependencies.get('global_comp_iters', [])
+                     x_c, y_c, std_c = get_series_data(c_iters, c_meas, c_bg, ana_type, spec['variable'])
+                     if y_c is not None:
+                         comparison_runs.append((x_c, y_c, std_c, comp_label, colors[1] if len(colors)>1 else None))
+                         means_to_scale.append(y_c * s_factor)
+
+                # Handling for new multi-comparison structure
+                if spec.get("show_comp") and check_dependencies.get('multi_comparisons'):
+                    multi_comp = check_dependencies['multi_comparisons']
+                    for i, comp_deps in enumerate(multi_comp):
+                        c_meas = comp_deps.get('measurements')
+                        c_bg = comp_deps.get('backgrounds', {})
+                        c_pre = comp_deps.get('precomputed_data', {})
+                        c_iters = comp_deps.get('iterations', [])
+                        
+                        # We need to temporarily add precomputed_data to check_dependencies for get_series_data to find it
+                        # This is a bit hacky but keeps the helper simple.
+                        orig_comp_pre = check_dependencies.get('comp_precomputed_data')
+                        check_dependencies['comp_precomputed_data'] = c_pre
+                        
+                        x_mc, y_mc, std_mc = get_series_data(c_iters, c_meas, c_bg, ana_type, spec['variable'])
+                        
+                        # Restore
+                        check_dependencies['comp_precomputed_data'] = orig_comp_pre
+                        
+                        if y_mc is not None:
+                            c_label = comp_deps.get('label', f"Comp {i+1}")
+                            c_color = comp_deps.get('color')
+                            comparison_runs.append((x_mc, y_mc, std_mc, c_label, c_color))
+                            means_to_scale.append(y_mc * s_factor)
+
+                # Calculate Y-range if not manual
+                panel_ylim = spec.get("ylim")
+                if panel_ylim is None and means_to_scale:
+                    if anchor_to_primary and y_p is not None:
+                         # Scale to PRIMARY only
+                         scale_source = y_p * s_factor
+                    else:
+                         # Scale to ALL
+                         scale_source = np.concatenate([m for m in means_to_scale if m is not None])
+                    
+                    if scale_source.size > 0 and not np.all(np.isnan(scale_source)):
+                        mn, mx = np.nanmin(scale_source), np.nanmax(scale_source)
+                        pad = (mx - mn) * 0.15 
+                        if pad == 0: pad = 0.1 * abs(mn) if mn != 0 else 1.0
+                        panel_ylim = (mn - pad, mx + pad)
+
+                if y_p is not None:
+                    plotting.create_mpl_line(
+                        x_p, y_p, ax, y_err=std_p if spec['show_std'] else None,
+                        label=primary_label,
+                        xlabel=panel_xlabel, ylabel=panel_ylabel,
+                        show_x=show_x, show_y=show_y,
+                        style=active_style, color=colors[0],
+                        disable_sci_x=disable_sci_angle,
+                        disable_sci_y=disable_sci_y,
+                        ylim=panel_ylim,
+                        scale_factor=s_factor,
+                        internal_label=int_label
+                    )
+                
+                # Plot all collected comparisons
+                for x_c, y_c, std_c, c_lab, c_col in comparison_runs:
+                    plotting.create_mpl_line(
+                        x_c, y_c, ax, 
+                        y_err=std_c if spec.get('show_std_comp', False) else None, 
+                        label=c_lab,
+                        color=c_col if c_col else None,
+                        linestyle='--',
+                        xlabel=panel_xlabel, ylabel=panel_ylabel,
+                        show_x=show_x, show_y=show_y,
+                        style=active_style,
+                        disable_sci_x=disable_sci_angle,
+                        disable_sci_y=disable_sci_y,
+                        ylim=panel_ylim,
+                        scale_factor=s_factor
+                    )
+
+                if show_legend and (y_p is not None or comparison_runs):
+                    ax.legend(loc=legend_loc)
+                
+        except Exception as e:
+            print(f"Error in panel ({r},{c}): {e}")
+
+    plt.tight_layout()
+    return fig
+
+def render_figure_composer(measurements, cache_root):
+    # --- Sidebar Dataset Info & Switcher ---
+    p_state = st.session_state.get('p_state', {})
+    active_desc = p_state.get('description', "Unknown Dataset")
+    active_seq = p_state.get('meas_seq', "Unknown")
+    
+    st.sidebar.title("Figure Builder Tools")
+    st.sidebar.markdown(f"**Current Dataset:**\n### {active_desc}")
+    st.sidebar.caption(f"ID: `{active_seq}`")
+    
+    st.sidebar.divider()
+    
+    # --- Analysis Type Filter ---
+    st.sidebar.subheader("Filter Options")
+    fb_filter_type = st.sidebar.selectbox("Filter Analysis Type", ["All", "Mueller Matrix", "Depolarization Ratio"], key="fb_filter_type")
+    
+    cached_datasets = app_utils.scan_local_cache(cache_root)
+    if cached_datasets:
+        st.sidebar.subheader("Quick Switch")
+        
+        # Filter cached datasets by selected analysis type
+        if fb_filter_type != "All":
+            filtered_cached = [d for d in cached_datasets if app_utils.get_analysis_type_from_sequence(d.get('Sequence')) == fb_filter_type]
+        else:
+            filtered_cached = cached_datasets
+            
+        cached_opts = [f"{d['Date']} | {app_utils.translate_sequence_name(d['Sequence'])} ({d['Sequence']})" for d in filtered_cached]
+        
+        curr_idx = 0
+        current_combined = f"{p_state.get('date')} | {active_desc} ({active_seq})"
+        if current_combined in cached_opts:
+            curr_idx = cached_opts.index(current_combined)
+            
+        sel_switch = st.sidebar.selectbox("Jump to Dataset", cached_opts, index=curr_idx, key="fb_sidebar_switcher")
+        
+        if sel_switch != current_combined:
+            parts = sel_switch.split(" | ", 1)
+            date_val = parts[0]
+            rest = parts[1]
+            seq_val = rest.rsplit(" (", 1)[-1][:-1]
+            
+            new_dataset = next((d for d in cached_datasets if d['Date'] == date_val and d['Sequence'] == seq_val), None)
+            if new_dataset:
+                st.session_state.target_load = {
+                    "date": date_val,
+                    "meas_parent": os.path.basename(os.path.dirname(os.path.dirname(new_dataset['LocalPath']))),
+                    "meas_seq": seq_val,
+                    "meas_path": new_dataset['LocalPath'],
+                    "description": app_utils.translate_sequence_name(seq_val),
+                    "switch_to_mode": "Figure Builder"
+                }
+                st.rerun()
+    
+    st.sidebar.divider()
+    
     st.header("Figure Builder")
     
     # --- 0. Configuration Management ---
@@ -30,7 +353,7 @@ def render_figure_composer(measurements):
                     # Filter session state for relevant keys
                     keys_to_save = [k for k in st.session_state.keys() if 
                                     k.startswith(('global_', 'pt_', 'ug_', 'it_', 'sit_', 'mk_', 'var_', 'std_', 'cp_', 'ms_', 'ymn_', 'ymx_', 'dk_', 'ci_', 'ov_', 'xl_', 'yl_')) or 
-                                    k in ['angle_range']]
+                                    k in ['angle_range', 'fb_layout', 'angle_min_fb', 'angle_max_fb', 'angle_range_slider_fb', 'global_iters', 'global_select_all']]
                     config_data = {k: st.session_state[k] for k in keys_to_save}
                     
                     fpath = os.path.join(config_dir, f"{save_name}.json")
@@ -59,27 +382,69 @@ def render_figure_composer(measurements):
                 st.info("No saved configurations found.")
 
     # --- 1. Global Settings ---
-    with st.expander("Global Chart Settings", expanded=False):
+    with st.expander("Global Figure Settings", expanded=False):
         c1, c2, c3 = st.columns(3)
         # Dimensions
         unit = c1.selectbox("Unit", ["inch", "px"], index=0, key="global_unit")
         if unit == "inch":
-            w = c2.number_input("Width (in)", value=6.0, step=0.1, key="global_w_in")
-            h = c3.number_input("Height (in)", value=4.0, step=0.1, key="global_h_in")
+            w = c2.number_input("Width (in)", value=10.0, step=0.1, key="global_w_in")
+            h = c3.number_input("Height (in)", value=7.0, step=0.1, key="global_h_in")
         else:
             w = c2.number_input("Width (px)", value=1000, step=100, key="global_w_px")
-            h = c3.number_input("Height (px)", value=800, step=100, key="global_h_px")
+            h = c3.number_input("Height (px)", value=700, step=100, key="global_h_px")
             
         # Angle Range
         if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 168.0)
-        angle_range = st.slider("Global Angle Range [deg]", 50.0, 170.0, st.session_state.angle_range, key="angle_range_widget")
-        st.session_state.angle_range = angle_range # Sync
+        
+        # Callbacks for sync
+        def _sync_from_slider_fb():
+            low, high = st.session_state.angle_range_slider_fb
+            st.session_state.angle_min_fb = int(low)
+            st.session_state.angle_max_fb = int(high)
+            st.session_state.angle_range = (float(low), float(high))
+
+        def _sync_from_inputs_fb():
+            low = st.session_state.angle_min_fb
+            high = st.session_state.angle_max_fb
+            st.session_state.angle_range_slider_fb = (float(low), float(high))
+            st.session_state.angle_range = (float(low), float(high))
+
+        # Init session state if missing or out of bounds
+        low_init = max(50.0, min(170.0, st.session_state.angle_range[0]))
+        high_init = max(50.0, min(170.0, st.session_state.angle_range[1]))
+        
+        if 'angle_min_fb' not in st.session_state: st.session_state.angle_min_fb = int(low_init)
+        if 'angle_max_fb' not in st.session_state: st.session_state.angle_max_fb = int(high_init)
+        if 'angle_range_slider_fb' not in st.session_state: st.session_state.angle_range_slider_fb = (float(st.session_state.angle_min_fb), float(st.session_state.angle_max_fb))
+
+        # Ensure widget keys are in sync with global state if changed elsewhere (e.g. Interactive Analysis)
+        # We use ceil for the min input to stay safely above or at low_init
+        target_min = int(np.ceil(low_init)) if low_init > int(low_init) else int(low_init)
+        if st.session_state.angle_min_fb != target_min: st.session_state.angle_min_fb = target_min
+        if st.session_state.angle_max_fb != int(high_init): st.session_state.angle_max_fb = int(high_init)
+        
+        # Slider state MUST be strictly within [50.0, 170.0]
+        st_low = max(50.0, min(170.0, float(st.session_state.angle_min_fb)))
+        st_high = max(50.0, min(170.0, float(st.session_state.angle_max_fb)))
+        
+        if st.session_state.angle_range_slider_fb != (st_low, st_high):
+             st.session_state.angle_range_slider_fb = (st_low, st_high)
+
+        ac1, ac2, ac3 = st.columns([0.4, 0.3, 0.3])
+        
+        # User widgets with callbacks
+        ac2.number_input("Min Angle [deg]", 50, 170, step=1, key="angle_min_fb", on_change=_sync_from_inputs_fb)
+        ac3.number_input("Max Angle [deg]", 50, 170, step=1, key="angle_max_fb", on_change=_sync_from_inputs_fb)
+        ac1.slider("Coarse Adjust", 50.0, 170.0, key="angle_range_slider_fb", on_change=_sync_from_slider_fb)
+        
+        # Final sync to global key used by plotting
+        st.session_state.angle_range = (float(st.session_state.angle_min_fb), float(st.session_state.angle_max_fb))
         
         # Style & Scaling
         c_s1, c_s2, c_s3 = st.columns(3)
-        style_name = c_s1.selectbox("Style Preset", list(plotting.STYLES.keys()), index=0, key="global_style")
-        font_scale = c_s2.number_input("Font Scale", 0.5, 2.0, 1.0, 0.1, key="global_font_scale")
-        disable_sci_angle = c_s3.checkbox("No Sci Notation (X)", value=True, key="global_no_sci")
+        style_name = c_s1.selectbox("Style Preset", list(plotting.STYLES.keys()), key="global_style")
+        font_scale = c_s2.number_input("Font Scale", 0.5, 2.0, step=0.1, key="global_font_scale")
+        disable_sci_angle = c_s3.checkbox("No Sci Notation (X)", key="global_no_sci")
         
         selected_style = plotting.STYLES[style_name]
         # Apply scaling to style copy
@@ -88,10 +453,15 @@ def render_figure_composer(measurements):
         active_style.font_size = int(active_style.font_size * font_scale)
         
         # Label Settings
-        common_labels = st.checkbox("Common Labels", value=True, help="Hide inner axis labels in grid layouts.", key="global_common_labels")
-        global_xlabel = st.text_input("Global X Label", value="Scattering Angle [deg]", key="global_xlabel")
-        global_ylabel = st.text_input("Global Y Label", value="Intensity [a.u.]", key="global_ylabel")
+        c_l1, c_l2 = st.columns(2)
+        common_labels = c_l1.checkbox("Common Labels", help="Hide inner axis labels in grid layouts.", key="global_common_labels")
+        show_std_global = c_l2.checkbox("Show Standard Deviation", help="Shade standard deviation if multiple iterations are averaged.", key="global_show_std")
         
+        global_xlabel = st.text_input("Global X Label", key="global_xlabel")
+        global_ylabel = st.text_input("Global Y Label", key="global_ylabel")
+        
+        anchor_to_primary = st.checkbox("Anchor Y-Scaling to Primary Only", value=True, help="Determine Y-axis limits using only primary data, even when comparisons are added.", key="global_anchor")
+
         # Color Schemes
         COLOR_SCHEMES = {
             "Default (Blue/Red)": ("#1f77b4", "#d62728"),
@@ -102,7 +472,7 @@ def render_figure_composer(measurements):
             "Pastel (Blue/Pink)": ("#a1c9f4", "#fbe4ff"),
             "Custom": (None, None)
         }
-        scheme_name = st.selectbox("Color Scheme", list(COLOR_SCHEMES.keys()), index=0, key="global_color_scheme")
+        scheme_name = st.selectbox("Color Scheme", list(COLOR_SCHEMES.keys()), key="global_color_scheme")
         
         if scheme_name == "Custom":
             c_col1, c_col2 = st.columns(2)
@@ -119,8 +489,8 @@ def render_figure_composer(measurements):
         comp_label = l_c2.text_input("Comparison Label", value="Comparison", key="lbl_comp")
         
         ll_c1, ll_c2 = st.columns(2)
-        show_legend = ll_c1.checkbox("Show Legend", value=True, key="lbl_show")
-        legend_loc = ll_c2.selectbox("Legend Loc", ["best", "upper right", "upper left", "lower left", "lower right", "center right"], index=0, key="lbl_loc")
+        show_legend = ll_c1.checkbox("Show Legend", key="lbl_show")
+        legend_loc = ll_c2.selectbox("Legend Loc", ["best", "upper right", "upper left", "lower left", "lower right", "center right"], key="lbl_loc")
 
         st.markdown("---")
         st.markdown("**Primary Data Iterations**")
@@ -131,57 +501,124 @@ def render_figure_composer(measurements):
 # AND update lines ~400 and ~420 for plotting.
 # I will do this in 2 chunks to be safe.
 
-        all_iters = sorted(measurements.keys())
+        # Determine the true analysis type for the current primary dataset
+        active_dataset_type = app_utils.get_analysis_type_from_sequence(active_seq)
+
+        # Dataset Change Detection: Reset iteration selections if sequence ID changed
+        last_seq = st.session_state.get('fb_last_seq')
+        if last_seq != active_seq:
+            if 'global_iters' in st.session_state: del st.session_state['global_iters']
+            if 'global_select_all' in st.session_state: del st.session_state['global_select_all']
+            st.session_state.fb_last_seq = active_seq
+
+        all_iters = sorted(measurements.keys()) if measurements else []
+        if not all_iters and st.session_state.get('precomputed_data'):
+            pre_data = st.session_state.precomputed_data
+            all_iters = sorted([int(k) if str(k).isdigit() else k for k in pre_data.keys() if k not in ['metadata', 'Average']])
+        iter_label_map = {f"{app_utils.translate_sequence_name(str(it))} ({it})": it for it in all_iters}
+        iter_labels = list(iter_label_map.keys())
+        
         ic1, ic2 = st.columns([0.2, 0.8])
-        select_all_iters = ic1.checkbox("Select All", value=False, key="global_select_all")
-        default_iters = all_iters if select_all_iters else ([all_iters[0]] if all_iters else [])
+        select_all_iters = ic1.checkbox("Select All", value=True, key="global_select_all")
         
         if select_all_iters:
-             global_iters = ic2.multiselect("Iterations", all_iters, default=all_iters, disabled=True, key="global_iters_disabled")
+             global_iters_labels = ic2.multiselect("Iterations", iter_labels, default=iter_labels, disabled=True, key="global_iters_disabled")
              global_iters = all_iters
         else:
-             global_iters = ic2.multiselect("Iterations", all_iters, default=default_iters, key="global_iters")
+             default_iter_labels = [iter_labels[0]] if iter_labels else []
+             global_iters_labels = ic2.multiselect("Iterations", iter_labels, default=default_iter_labels, key="global_iters")
+             global_iters = [iter_label_map[l] for l in global_iters_labels]
+
+        # Robust Fallback: If nothing selected, pick first to prevent blank plots
+        if not global_iters and all_iters:
+             global_iters = [all_iters[0]]
 
 
     # --- 1b. Comparison Data Source ---
     with st.expander("Comparison Data Source", expanded=True):
-        comp_path = st.text_input("Comparison Folder Path", value="")
-        if st.button("Load Comparison Measurement"):
-            if os.path.isdir(comp_path):
-                # Let's assume input is the PARENT folder containing 'measurements' and 'backgrounds'
-                m_path = os.path.join(comp_path, 'measurements')
-                b_path = os.path.join(comp_path, 'backgrounds')
-                if os.path.exists(m_path) and os.path.exists(b_path):
-                     c_meas, c_bg, err = polarimeter_processing.find_and_organize_files(m_path, b_path)
-                     if c_meas:
-                         st.session_state.comp_measurements = c_meas
-                         st.session_state.comp_backgrounds = c_bg
-                         st.success(f"Loaded {len(c_meas)} iterations for comparison.")
-                     else: st.error(err)
+        if 'multi_comparisons' not in st.session_state: st.session_state.multi_comparisons = []
+        
+        source_mode = st.radio("Source Mode", ["Select Preprocessed Dataset", "Manual Folder Path"], horizontal=True, key="comp_source_mode")
+        
+        comp_to_add = None
+        
+        if source_mode == "Select Preprocessed Dataset":
+            # Select from Preprocessed Data (Local Cache)
+            cached_datasets = app_utils.scan_local_cache(cache_root)
+            if cached_datasets:
+                if fb_filter_type != "All":
+                    comp_cached = [d for d in cached_datasets if app_utils.get_analysis_type_from_sequence(d.get('Sequence', "")) == fb_filter_type]
                 else:
-                    st.error("Could not find 'measurements' and 'backgrounds' subfolders in the specified path.")
-            else:
-                st.error("Invalid Path: Folder does not exist.")
+                    comp_cached = cached_datasets
+                
+                if comp_cached:
+                    cached_opts = [f"{d['Date']} | {app_utils.translate_sequence_name(d['Sequence'])} ({d['Sequence']})" for d in comp_cached]
+                    sel_cached = st.selectbox("Select Cached Dataset", cached_opts, key="comp_cache_sel")
+                    
+                    if st.button("Add to Comparisons"):
+                        target_d = comp_cached[cached_opts.index(sel_cached)]
+                        pre_data, _, _ = app_utils.try_load_precomputed(target_d['LocalPath'])
+                        if pre_data:
+                            comp_to_add = {
+                                "label": target_d['Sequence'],
+                                "precomputed_data": pre_data,
+                                "iterations": sorted(pre_data.keys(), key=lambda x: (x != "Average", x)),
+                                "color": None # Will assign from palette
+                            }
+                else: st.info(f"No {fb_filter_type} datasets found in cache.")
 
-        # Comparison Iterations
-        global_comp_iters = []
-        if 'comp_measurements' in st.session_state and st.session_state.comp_measurements:
-            st.markdown("**Comparison Iterations**")
-            c_iters = sorted(st.session_state.comp_measurements.keys())
-            cc1, cc2 = st.columns([0.2, 0.8])
-            comp_select_all = cc1.checkbox("Select All (Comp)", value=True, key="comp_select_all")
-            if comp_select_all:
-                global_comp_iters = cc2.multiselect("Comp Iters", c_iters, default=c_iters, disabled=True, key="global_comp_iters_disabled")
-                global_comp_iters = c_iters # Ensure it's all even if disabled
-            else:
-                default_comp_iters = [c_iters[0]] if c_iters else []
-                global_comp_iters = cc2.multiselect("Comp Iters", c_iters, default=default_comp_iters, key="global_comp_iters")
         else:
-            st.info("Load comparison data to enable comparison iteration selection.")
+            comp_path = st.text_input("Comparison Folder Path", value="", key="comp_path_input")
+            if st.button("Load & Add comparison"):
+                if os.path.isdir(comp_path):
+                    m_path = os.path.join(comp_path, 'measurements')
+                    b_path = os.path.join(comp_path, 'backgrounds')
+                    if os.path.exists(m_path) and os.path.exists(b_path):
+                         c_meas, c_bg, _ = polarimeter_processing.find_and_organize_files(m_path, b_path)
+                         if c_meas:
+                             comp_to_add = {
+                                 "label": os.path.basename(comp_path),
+                                 "measurements": c_meas,
+                                 "backgrounds": c_bg,
+                                 "iterations": sorted(c_meas.keys())
+                             }
+                    else: st.error("Missing folders.")
+
+        if comp_to_add:
+            # Check for duplicates
+            if not any(c['label'] == comp_to_add['label'] for c in st.session_state.multi_comparisons):
+                # Assign Color
+                colors_comp = ["#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+                idx = len(st.session_state.multi_comparisons)
+                comp_to_add['color'] = colors_comp[idx % len(colors_comp)]
+                st.session_state.multi_comparisons.append(comp_to_add)
+                st.success(f"Added: {comp_to_add['label']}")
+            else: st.warning("Already added.")
+
+        # Display and Manage Comparisons
+        if st.session_state.multi_comparisons:
+            st.divider()
+            st.markdown("**Active Comparisons**")
+            to_remove = None
+            for i, comp in enumerate(st.session_state.multi_comparisons):
+                c_col1, c_col2, c_col3 = st.columns([0.1, 0.7, 0.2])
+                c_col1.markdown(f"<div style='width:20px;height:20px;background-color:{comp['color']};border-radius:3px;'></div>", unsafe_allow_html=True)
+                c_col2.caption(comp['label'])
+                if c_col3.button("🗑️", key=f"rm_{i}"): to_remove = i
+            
+            if to_remove is not None:
+                st.session_state.multi_comparisons.pop(to_remove)
+                st.rerun()
+            
+            if st.button("Clear All"):
+                st.session_state.multi_comparisons = []
+                st.rerun()
+        else:
+            st.info("No comparisons added yet.")
 
 
     # --- 2. Layout & Content ---
-    layout_type = st.radio("Layout", ["Single Panel", "1x2 Grid (V)", "2x1 Grid (H)", "2x2 Grid"], index=0, horizontal=True)
+    layout_type = st.radio("Layout", ["Single Panel", "1x2 Grid (V)", "2x1 Grid (H)", "2x2 Grid"], index=0, horizontal=True, key="fb_layout")
     
     slots = []
     if layout_type == "Single Panel": slots = [(1,1)]
@@ -192,9 +629,20 @@ def render_figure_composer(measurements):
     fig_specs = {}
     
     # Load Angle Model globally for slicing
+    angle_range = st.session_state.angle_range
     angle_model = None
     if hasattr(app_utils, 'load_angle_model_from_npz'):
         angle_model = app_utils.load_angle_model_from_npz(app_utils.CALIBRATION_FILE_PATH)
+
+    # Prepare Dependencies for generate_composite_figure
+    check_dependencies = {
+        'measurements': measurements,
+        'backgrounds': st.session_state.backgrounds,
+        'precomputed_data': st.session_state.get('precomputed_data'),
+        'active_dataset_type': st.session_state.get('analysis_type', 'Mueller Matrix'),
+        'multi_comparisons': st.session_state.get('multi_comparisons', []),
+        'iterations': global_iters
+    }
 
     st.subheader("Panel Configuration")
     
@@ -214,10 +662,12 @@ def render_figure_composer(measurements):
                 if use_global:
                     iters_to_use = global_iters
                 else:
-                    iters_to_use = cols[0].multiselect(f"Iterations", all_iters, default=[all_iters[0]], key=f"it_{r}_{c}")
+                    panel_it_labels = cols[0].multiselect(f"Iterations", iter_labels, default=[iter_labels[0]] if iter_labels else [], key=f"it_{r}_{c}")
+                    iters_to_use = [iter_label_map[l] for l in panel_it_labels]
             elif p_type in ["Raw Image", "Signal Decomposition"]:
                 # Single Iteration Selection usually
-                iters_to_use = [cols[0].selectbox(f"Iteration", all_iters, key=f"sit_{r}_{c}")]
+                sit_label = cols[0].selectbox(f"Iteration", iter_labels, key=f"sit_{r}_{c}")
+                iters_to_use = [iter_label_map[sit_label]] if sit_label else []
 
             spec = {
                 "iters": iters_to_use,
@@ -243,11 +693,11 @@ def render_figure_composer(measurements):
                 spec["variable"] = st.selectbox(f"Variable", var_options, key=f"var_{r}_{c}")
                 
                 c_opt1, c_opt2 = st.columns(2)
-                spec["show_std"] = c_opt1.checkbox(f"Show Std Dev", value=len(iters_to_use)>1, key=f"std_{r}_{c}")
+                spec["show_std"] = c_opt1.checkbox(f"Show Std Dev", value=st.session_state.get('global_show_std', len(iters_to_use)>1), key=f"std_{r}_{c}")
                 
                 # Comparison Overlay Option
-                if global_comp_iters and 'comp_measurements' in st.session_state and st.session_state.comp_measurements:
-                     spec["show_comp"] = c_opt2.checkbox(f"Overlay Comp", value=False, key=f"cp_{r}_{c}")
+                if st.session_state.get('multi_comparisons'):
+                     spec["show_comp"] = c_opt2.checkbox(f"Overlay Comp(s)", value=False, key=f"cp_{r}_{c}")
                 
                 # Manual Scaling
                 with st.expander("Manual Axis Scaling (Optional)"):
@@ -303,208 +753,27 @@ def render_figure_composer(measurements):
         with r2_c2:
             fig_specs[(2,2)] = _render_panel_config(2,2)
 
+    # Final Figure Generation
+    fig = generate_composite_figure(
+        fig_specs, layout_type, w, h, unit, 
+        check_dependencies=check_dependencies,
+        common_labels=common_labels,
+        global_xlabel=global_xlabel, global_ylabel=global_ylabel,
+        active_style=active_style,
+        colors=colors,
+        primary_label=primary_label,
+        show_legend=show_legend,
+        legend_loc=legend_loc,
+        disable_sci_angle=disable_sci_angle,
+        angle_range=angle_range,
+        angle_model=angle_model,
+        pixel_offset=PIXEL_OFFSET_X,
+        anchor_to_primary=st.session_state.get('global_anchor', False)
+    )
+    st.session_state.fig_preview = fig
+
     st.divider()
     
-    # 3. Composition
-    if st.button("Generate Preview"):
-        rows = 2 if "2x" in layout_type or "1x2" in layout_type else 1
-        cols = 2 if "2x2" in layout_type or "2x1" in layout_type else 1
-        
-        # Dimensions
-        if unit == "px":
-             final_w, final_h = w / 100.0, h / 100.0 # Convert px to inches for matplotlib
-        else:
-             final_w, final_h = w, h
-
-        plt.close('all')
-        fig = plt.figure(figsize=(final_w, final_h))
-        
-        # Spacing
-        if common_labels: fig.subplots_adjust(wspace=0.25, hspace=0.05)
-        else: fig.subplots_adjust(wspace=0.35, hspace=0.35)
-
-        for (r, c), spec in fig_specs.items():
-            idx = (r-1)*cols + c
-            ax = fig.add_subplot(rows, cols, idx)
-            
-            # Determine Axes Visibility
-            # User requested Y labels on right plots too, as they might differ.
-            # So we typically always show Y labels unless explicitly handled otherwise.
-            show_y = True 
-            show_x = (r == rows) or (not common_labels)
-            
-            panel_xlabel = spec.get("xlabel", global_xlabel) if show_x else ""
-            panel_ylabel = spec.get("ylabel", global_ylabel) if show_y else ""
-
-            try:
-                # --- PREPARE DATA ---
-                # Resolve X-axis (Angles)
-                # Using 1280 pixels standard width assumption if model unused?
-                # Better: Use angle_model if available.
-                
-                if spec["type"] == "Raw Image":
-                    # For Heatmap, we need to slice the image to the angle range
-                    img = np.array(Image.open(spec["file"])) # (H, W)
-                    
-                    x_pixel_min, x_pixel_max = 0, img.shape[1]
-                    if angle_model:
-                        # Map all pixels to angles
-                        all_angles = angle_model(np.arange(img.shape[1]))
-                        # Find indices within range
-                        valid_mask = (all_angles >= angle_range[0]) & (all_angles <= angle_range[1])
-                        if np.any(valid_mask):
-                             # Get bounds
-                             valid_indices = np.where(valid_mask)[0]
-                             x_pixel_min, x_pixel_max = valid_indices[0], valid_indices[-1]
-                             
-                             # Adjust Image
-                             img = img[:, x_pixel_min:x_pixel_max+1]
-                    
-                    # Plot
-                    plotting.create_mpl_heatmap(
-                        img, ax, cmap='viridis', 
-                        title=f"({r},{c})", 
-                        xlabel=panel_xlabel, ylabel=panel_ylabel,
-                        show_x=show_x, show_y=show_y,
-                        style=active_style
-                    )
-
-                elif spec["type"] == "Signal Decomposition":
-                     # Decomposition is vertical, so X-axis is Intensity, Y-axis is Pixel Height
-                     # Angle range doesn't apply here usually (it's a column).
-                     img = np.array(Image.open(spec["file"])).astype(float)
-                     col_idx = int(spec['col_idx'])
-                     if col_idx < 0 or col_idx >= img.shape[1]: continue
-                     norm_profile = img[:, col_idx]
-                     y_pixels = np.arange(len(norm_profile))
-                     popt = polarimeter_processing.fit_double_gaussian_params(y_pixels, norm_profile)
-                     
-                     plotting.create_mpl_decomposition(
-                        y_pixels, norm_profile, ax, popt=popt,
-                        xlabel=panel_xlabel, ylabel=panel_ylabel,
-                        show_x=show_x, show_y=show_y,
-                        style=active_style
-                     )
-
-                elif spec["type"] == "Computed Data":
-                    # Function to process a list of iterations and return Mean/Std/X
-                    def get_series_data(t_iters, t_meas, t_bg, t_ana_type, t_var):
-                        t_curves = []
-                        t_x = None
-                        
-                        if not t_iters: return None, None, None
-                        
-                        for it in t_iters:
-                            # Fetch Data Logic
-                            temp_meas = {it: t_meas[it]}
-                            req = app_utils.get_required_measurements(temp_meas, t_ana_type)
-                            
-                            iter_res = None
-                            # For primary data, check precomputed cache
-                            if t_meas is st.session_state.measurements and 'precomputed_data' in st.session_state:
-                                 cached = st.session_state.precomputed_data.get(str(it))
-                                 if cached and (('I_PV' in cached) or ('Depol_Parallel' in cached)): 
-                                     iter_res = cached
-                            
-                            # If not cached or for comparison data, compute
-                            if iter_res is None:
-                                calc_res, _ = app_computation.calculate_curves_for_iteration(
-                                    it, t_meas, t_bg, req, t_ana_type, 
-                                    True, 3.0, 1e-4, angle_model or app_utils.load_angle_model_from_npz(app_utils.CALIBRATION_FILE_PATH)
-                                )
-                                if calc_res: iter_res = calc_res
-                            
-                            if not iter_res: continue
-                            
-                            y_val = None
-                            # Calculate derived vars if needed
-                            mm_elems = polarimeter_processing.calculate_mueller_elements(iter_res)
-                            
-                            if t_var in iter_res: y_val = iter_res[t_var]
-                            elif mm_elems and t_var in mm_elems: y_val = mm_elems[t_var]
-                            elif t_var == "Depolarization Ratio":
-                                if 'Depol_Parallel' in iter_res and 'Depol_Cross' in iter_res:
-                                    y_val = (iter_res['Depol_Cross']+1e-9)/(iter_res['Depol_Parallel']+1e-9)
-                            
-                            if y_val is not None:
-                                # Re-map X to Angle if model exists
-                                if t_x is None:
-                                    if angle_model:
-                                        t_x = angle_model(np.arange(len(y_val)))
-                                    else:
-                                        t_x = np.arange(len(y_val))
-                                t_curves.append(y_val)
-                        
-                        if not t_curves or t_x is None: return None, None, None
-                        
-                        # Stack and calculate mean/std
-                        stack = np.vstack(t_curves) # (N_iter, N_pixels)
-                        mean_curve = np.mean(stack, axis=0)
-                        std_curve = np.std(stack, axis=0) if len(t_curves) > 1 else None
-                        
-                        # Filter by Angle Range
-                        mask = (t_x >= angle_range[0]) & (t_x <= angle_range[1])
-                        return t_x[mask], mean_curve[mask], std_curve[mask] if std_curve is not None else None
-
-                    # Determine Analysis Type (based on first iteration's data keys)
-                    # This is a heuristic, might need refinement if data structure varies wildly
-                    ana_type = "Mueller Matrix" 
-                    if spec['iters']:
-                        first_iter_keys = list(measurements[spec['iters'][0]].keys())
-                        if not any('I_PV' in k for k in first_iter_keys): # If no I_PV, assume it's not MM
-                            if "Depolarization Ratio" == spec["variable"]:
-                                ana_type = "Depolarization Ratio"
-                            # else, default to MM and hope for the best or error out
-
-                    # 1. Primary Data
-                    x_p, y_p, std_p = get_series_data(spec['iters'], measurements, st.session_state.backgrounds, ana_type, spec['variable'])
-                    
-                    if x_p is not None:
-                         # Plot Primary
-                        plotting.create_mpl_line(
-                            x_p, y_p, ax, y_err=std_p if spec['show_std'] else None,
-                            label=primary_label,
-                            xlabel=panel_xlabel, ylabel=panel_ylabel,
-                            show_x=show_x, show_y=show_y,
-                            style=active_style, color=colors[0],
-                            disable_sci_x=disable_sci_angle,
-                            ylim=spec.get("ylim")
-                        )
-                    else:
-                        st.warning(f"No valid primary data for {spec['iters']}")
-                    
-                    # 2. Comparison Data Overlay
-                    if spec.get("show_comp") and 'comp_measurements' in st.session_state and st.session_state.comp_measurements:
-                         c_meas = st.session_state.comp_measurements
-                         c_bg = st.session_state.get('comp_backgrounds', {})
-                         c_iters = global_comp_iters # Use globally selected comp iters
-                         
-                         x_c, y_c, std_c = get_series_data(c_iters, c_meas, c_bg, ana_type, spec['variable'])
-                         
-                         if x_c is not None:
-                             plotting.create_mpl_line(
-                                x_c, y_c, ax, y_err=std_c if spec['show_std'] else None, 
-                                label=comp_label,
-                                color=colors[1],
-                                linestyle='--',
-                                xlabel=panel_xlabel, ylabel=panel_ylabel, # These will be overridden by primary if not empty
-                                show_x=show_x, show_y=show_y,
-                                style=active_style,
-                                disable_sci_x=disable_sci_angle
-                             )
-                             if show_legend: ax.legend(loc=legend_loc) # Show legend if comparison exists
-                         else:
-                            st.warning(f"No valid comparison data for {c_iters}")
-                    
-                    elif show_legend: # If no comparison but legend requested (e.g. for Primary std dev)
-                        ax.legend(loc=legend_loc)
-                    
-            except Exception as e:
-                st.error(f"Error in ({r},{c}): {e}")
-
-        plt.tight_layout()
-        st.session_state.fig_preview = fig
-
     if 'fig_preview' in st.session_state:
         st.pyplot(st.session_state.fig_preview)
         
@@ -537,3 +806,47 @@ def render_figure_composer(measurements):
                         st.error(f"Error saving file: {e}")
                 else:
                     st.error(f"Directory not found: {out_dir}")
+
+            if st.session_state.get('multi_comparisons'):
+                if st.button("Generate Double Export (_base & _symmetric)"):
+                    if not os.path.exists(out_dir): 
+                        st.error("Invalid Output Directory")
+                    else:
+                        try:
+                            # 1. Base Figure
+                            orig_mc = check_dependencies.get('multi_comparisons', [])
+                            check_dependencies['multi_comparisons'] = []
+                            fig_base = generate_composite_figure(
+                                fig_specs, layout_type, w, h, unit, 
+                                check_dependencies=check_dependencies,
+                                common_labels=common_labels,
+                                global_xlabel=global_xlabel, global_ylabel=global_ylabel,
+                                active_style=active_style, colors=colors, primary_label=primary_label,
+                                show_legend=show_legend, legend_loc=legend_loc, disable_sci_angle=disable_sci_angle,
+                                angle_range=angle_range, angle_model=angle_model, pixel_offset=PIXEL_OFFSET_X,
+                                anchor_to_primary=st.session_state.get('global_anchor', False)
+                            )
+                            base_path = os.path.join(out_dir, f"{out_fname}_base.{fmt}")
+                            fig_base.savefig(base_path, format=fmt, dpi=dpi, bbox_inches='tight')
+                            plt.close(fig_base)
+
+                            # 2. Symmetric Figure
+                            check_dependencies['multi_comparisons'] = orig_mc
+                            fig_sym = generate_composite_figure(
+                                fig_specs, layout_type, w, h, unit, 
+                                check_dependencies=check_dependencies,
+                                common_labels=common_labels,
+                                global_xlabel=global_xlabel, global_ylabel=global_ylabel,
+                                active_style=active_style, colors=colors, primary_label=primary_label,
+                                show_legend=show_legend, legend_loc=legend_loc, disable_sci_angle=disable_sci_angle,
+                                angle_range=angle_range, angle_model=angle_model, pixel_offset=PIXEL_OFFSET_X,
+                                anchor_to_primary=st.session_state.get('global_anchor', False)
+                            )
+                            sym_path = os.path.join(out_dir, f"{out_fname}_symmetric.{fmt}")
+                            fig_sym.savefig(sym_path, format=fmt, dpi=dpi, bbox_inches='tight')
+                            plt.close(fig_sym)
+                            
+                            st.success(f"Generated double export:\n- {os.path.basename(base_path)}\n- {os.path.basename(sym_path)}")
+                        except Exception as e:
+                            st.error(f"Double export failed: {e}")
+                            check_dependencies['multi_comparisons'] = orig_mc

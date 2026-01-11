@@ -16,8 +16,13 @@ def render_raw_images_tab(measurements, backgrounds, comparisons, selected_iter_
     img_cols = st.columns(4)
     
     # Dataset Selector for Images
-    dataset_options = ["Primary"] + [c['name'] for c in comparisons]
-    selected_dataset_name = img_cols[0].selectbox("Dataset", dataset_options, key="img_dataset")
+    dataset_options = ["Primary"] + [f"{app_utils.translate_sequence_name(c['name'])} ({c['name']})" for c in comparisons]
+    selected_dataset_label = img_cols[0].selectbox("Dataset", dataset_options, key="img_dataset")
+    
+    # Decode selection
+    selected_dataset_name = "Primary"
+    if selected_dataset_label != "Primary":
+        selected_dataset_name = selected_dataset_label.rsplit(" (", 1)[-1][:-1]
     
     active_measurements = measurements or {}
     active_backgrounds = backgrounds or {}
@@ -144,8 +149,12 @@ def render_background_images_tab(backgrounds, comparisons, req_meas, bg_subtract
     toggle_cols = st.columns(2)
     show_regions_bg = toggle_cols[1].toggle("Show Integration Regions", key="bg_regions", help="Overlays the signal and wall-effect integration regions on the image.")
     img_cols = st.columns(4)
-    bg_dataset_options = ["Primary"] + [c['name'] for c in comparisons]
-    bg_selected_dataset_name = img_cols[0].selectbox("Dataset", bg_dataset_options, key="bg_dataset")
+    bg_dataset_options = ["Primary"] + [f"{app_utils.translate_sequence_name(c['name'])} ({c['name']})" for c in comparisons]
+    bg_selected_dataset_label = img_cols[0].selectbox("Dataset", bg_dataset_options, key="bg_dataset")
+    
+    bg_selected_dataset_name = "Primary"
+    if bg_selected_dataset_label != "Primary":
+        bg_selected_dataset_name = bg_selected_dataset_label.rsplit(" (", 1)[-1][:-1]
     active_bg_view = backgrounds or {}
     if bg_selected_dataset_name != "Primary":
         for c in comparisons:

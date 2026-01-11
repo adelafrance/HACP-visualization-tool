@@ -43,21 +43,30 @@ def scan_datasets(base_path, cache_root):
     """
     datasets = []
     
-    if not base_path or not os.path.exists(base_path):
-        return pd.DataFrame()
-
-    date_folders = sorted([d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))])
+    if base_path and os.path.exists(base_path):
+        try:
+            date_folders = sorted([d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))])
+        except OSError:
+            date_folders = []
+    else:
+        date_folders = []
     
     for date_folder in date_folders:
         date_path = os.path.join(base_path, date_folder)
-        subfolders = [d for d in os.listdir(date_path) if os.path.isdir(os.path.join(date_path, d))]
+        try:
+            subfolders = [d for d in os.listdir(date_path) if os.path.isdir(os.path.join(date_path, d))]
+        except OSError:
+            continue
         
         # Look for 'measurements' folder or custom measurement parents
         meas_parents = [d for d in subfolders if "meas" in d.lower()]
         
         for mp in meas_parents:
             mp_path = os.path.join(date_path, mp)
-            sequences = [d for d in os.listdir(mp_path) if os.path.isdir(os.path.join(mp_path, d))]
+            try:
+                sequences = [d for d in os.listdir(mp_path) if os.path.isdir(os.path.join(mp_path, d))]
+            except OSError:
+                continue
             
             for seq in sequences:
                 seq_path = os.path.join(mp_path, seq)
@@ -113,7 +122,9 @@ def scan_datasets(base_path, cache_root):
                 
                 # Refine Status
                 # Check for Partial
-                expected_iters = app_utils.count_iterations(seq_path)
+                expected_iters = 0
+                try: expected_iters = app_utils.count_iterations(seq_path)
+                except: pass
                 
                 # Helper to check partial
                 def check_partial_status(status, data_dict):
@@ -136,6 +147,7 @@ def scan_datasets(base_path, cache_root):
                     "Date": date_folder,
                     "Parent": mp,
                     "Sequence": seq,
+                    "Description": app_utils.translate_sequence_name(seq),
                     "Path": seq_path,
                     "Standard": std_status,
                     "Standard Time": format_timestamp(std_time),
@@ -143,8 +155,50 @@ def scan_datasets(base_path, cache_root):
                     "Dynamic Time": format_timestamp(dyn_time),
                     "Raw Time": format_timestamp(raw_mtime),
                     "Background Used": bg_info,
-                    "Expected Iters": expected_iters
+                    "Expected Iters": expected_iters,
+                    "IsLocal": False
                 })
+
+    # --- MERGE LOCAL-ONLY DATASETS ---
+    local_datasets = app_utils.scan_local_cache(cache_root)
+    existing_keys = {(d['Date'], d['Sequence']) for d in datasets}
+
+    for ld in local_datasets:
+        key = (ld['Date'], ld['Sequence'])
+        if key in existing_keys:
+            continue
+        
+        # This dataset is in local cache but NOT in the remote scan
+        # We need to load its metadata to fill the row
+        dummy_path = ld['LocalPath'] # Not actually the raw path, but used as reference for loading
+        proc_std, meta_std, _ = app_utils.try_load_precomputed(dummy_path, cache_root, mode="standard")
+        proc_dyn, meta_dyn, _ = app_utils.try_load_precomputed(dummy_path, cache_root, mode="dynamic")
+
+        bg_info = "Unknown"
+        if meta_std and 'background_info' in meta_std: bg_info = meta_std['background_info']
+        elif meta_dyn and 'background_info' in meta_dyn: bg_info = meta_dyn['background_info']
+
+        std_status = "Processed" if proc_std else "Missing"
+        dyn_status = "Processed" if proc_dyn else "Missing"
+        
+        # Reconstruct a likely remote path (best guess for reference)
+        ref_path = f"LOCAL_ONLY:{ld['LocalPath']}"
+
+        datasets.append({
+            "Date": ld['Date'],
+            "Parent": "Local Cache",
+            "Sequence": ld['Sequence'],
+            "Description": app_utils.translate_sequence_name(ld['Sequence']),
+            "Path": ref_path, 
+            "Standard": std_status,
+            "Standard Time": "N/A",
+            "Dynamic": dyn_status,
+            "Dynamic Time": "N/A",
+            "Raw Time": "Disconnected",
+            "Background Used": bg_info,
+            "Expected Iters": 0,
+            "IsLocal": True
+        })
                 
     return pd.DataFrame(datasets)
 
@@ -163,10 +217,11 @@ def render_dashboard(data_folder, cache_root):
         return
 
     # Filters
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 0.6])
     filter_date = c1.multiselect("Filter Date", df["Date"].unique())
     filter_status = c2.multiselect("Filter Status (Standard)", ["Processed", "Missing", "Outdated"])
     filter_bg = c3.multiselect("Filter Background", df["Background Used"].unique())
+    show_raw_seq = c4.checkbox("Show Raw IDs", value=False, help="Display the cryptic sequence names alongside descriptions.")
     
     filtered_df = df
     if filter_date: filtered_df = filtered_df[filtered_df["Date"].isin(filter_date)]
@@ -174,18 +229,19 @@ def render_dashboard(data_folder, cache_root):
     if filter_bg: filtered_df = filtered_df[filtered_df["Background Used"].isin(filter_bg)]
         
     # Display
-    # Ensure consistent sorting: Date then Sequence
-    filtered_df = filtered_df.sort_values(by=["Date", "Sequence"], ascending=[True, True])
-
+    filtered_df["BgDescription"] = filtered_df["Background Used"].apply(app_utils.translate_full_path)
+    
     st.dataframe(
-        filtered_df[["Date", "Parent", "Sequence", "Standard", "Dynamic", "Background Used", "Raw Time"]],
+        filtered_df[["Date", "Description", "Standard", "Dynamic", "BgDescription", "Raw Time", "Parent"] + (["Sequence"] if show_raw_seq else [])],
         use_container_width=True,
         hide_index=True,
         column_config={
             "Parent": st.column_config.TextColumn("Source Folder", width="small"),
+            "Description": st.column_config.TextColumn("Description", help="Human-readable translation of the sequence name."),
+            "Sequence": st.column_config.TextColumn("Sequence ID", width="small"),
             "Standard": st.column_config.TextColumn("Standard", validate="^Processed$|^Missing$|^Outdated$|^Partial.*$"),
             "Dynamic": st.column_config.TextColumn("Dynamic"),
-            "Background Used": st.column_config.TextColumn("Background Used", width="medium"),
+            "BgDescription": st.column_config.TextColumn("Background Used", width="medium", help="Translated background folder and sequence."),
             "Raw Time": st.column_config.TextColumn("Raw Modified")
         }
     )
@@ -200,39 +256,59 @@ def render_dashboard(data_folder, cache_root):
         st.subheader("Data Processor")
         
         # Dataset Selection for Processing
-        proc_opts = filtered_df.apply(lambda x: f"{x['Date']} | {x['Sequence']}", axis=1).tolist()
+        proc_opts = filtered_df.apply(lambda x: f"{x['Date']} | {x['Description']} ({x['Sequence']})", axis=1).tolist()
         sel_proc = st.selectbox("Select Dataset to Process", proc_opts, key="proc_sel")
         
         if sel_proc:
             # Decode
-            parts = sel_proc.split(" | ")
-            proc_row = filtered_df[(filtered_df["Date"] == parts[0]) & (filtered_df["Sequence"] == parts[1])].iloc[0]
+            parts = sel_proc.split(" | ", 1)
+            date_val = parts[0]
+            # Format is Description (Sequence) - use rsplit to handle descriptions with ( or |
+            rest = parts[1]
+            seq_val = rest.rsplit(" (", 1)[-1][:-1]
+            proc_row = filtered_df[(filtered_df["Date"] == date_val) & (filtered_df["Sequence"] == seq_val)].iloc[0]
             
-            # Find Background Candidates
-            date_path = os.path.dirname(os.path.dirname(proc_row['Path']))
-            bg_candidates = [d for d in os.listdir(date_path) if "back" in d.lower() or "bg" in d.lower()]
-            
-            p_c1, p_c2 = st.columns(2)
-            
-            # Default to 'background_laser' if present
-            bg_def_idx = 0
-            for i, c in enumerate(bg_candidates):
-                if "background_laser" in c.lower(): 
-                   bg_def_idx = i
-                   break
-            
-            bg_parent = p_c1.selectbox("Background Folder", bg_candidates, index=bg_def_idx if bg_candidates else None)
-            
+            # Background Discovery (Only if not Local-Only)
+            bg_candidates = []
             bg_seq = None
-            if bg_parent:
-                bg_parent_path = os.path.join(date_path, bg_parent)
-                bg_seqs = sorted([d for d in os.listdir(bg_parent_path) if os.path.isdir(os.path.join(bg_parent_path, d))])
+            is_local = proc_row.get('IsLocal', False)
+
+            if not is_local:
+                try:
+                    date_path = os.path.dirname(os.path.dirname(proc_row['Path']))
+                    bg_candidates = [d for d in os.listdir(date_path) if "back" in d.lower() or "bg" in d.lower()]
+                except:
+                    pass
                 
-                # Try to Auto-Select Best Background
-                best_bg = app_utils.find_best_background_folder(proc_row['Sequence'], proc_row['Path'], bg_parent_path)
-                def_idx = bg_seqs.index(best_bg) if best_bg in bg_seqs else 0
+                p_c1, p_c2 = st.columns(2)
                 
-                bg_seq = p_c2.selectbox("Background Sequence", bg_seqs, index=def_idx)
+                # Default to 'background_laser' if present
+                bg_def_idx = 0
+                for i, c in enumerate(bg_candidates):
+                    if "background_laser" in c.lower(): 
+                       bg_def_idx = i
+                       break
+                
+                bg_opts = [f"{app_utils.translate_bg_folder(c)} ({c})" for c in bg_candidates]
+                bg_parent_sel = p_c1.selectbox("Background Folder", bg_opts, index=bg_def_idx if bg_candidates else None)
+                bg_parent = bg_parent_sel.split(" (")[1][:-1] if bg_parent_sel else None
+                
+                if bg_parent:
+                    bg_parent_path = os.path.join(date_path, bg_parent)
+                    try:
+                        bg_seqs = sorted([d for d in os.listdir(bg_parent_path) if os.path.isdir(os.path.join(bg_parent_path, d))])
+                        # Try to Auto-Select Best Background
+                        best_bg = app_utils.find_best_background_folder(proc_row['Sequence'], proc_row['Path'], bg_parent_path)
+                        def_idx = bg_seqs.index(best_bg) if best_bg in bg_seqs else 0
+                        
+                        bg_seq_opts = [f"{app_utils.translate_sequence_name(s)} ({s})" for s in bg_seqs]
+                        bg_seq_sel = p_c2.selectbox("Background Sequence", bg_seq_opts, index=def_idx)
+                        bg_seq = bg_seq_sel.split(" (")[1][:-1] if bg_seq_sel else None
+                    except:
+                        st.error("Error reading background sequences.")
+            else:
+                st.info("ℹ️ **Local-Only Dataset**")
+                st.caption("Processing is unavailable because the raw measurement files are not present on this machine.")
                 
             st.caption(f"Will process: `{proc_row['Sequence']}` using `{bg_seq}`")
             
@@ -303,8 +379,10 @@ def render_dashboard(data_folder, cache_root):
                         except: pass
                         st.rerun()
 
-                if st.button("Start Background Processing", type="primary"):
-                    if not bg_seq:
+                if st.button("Start Background Processing", type="primary", disabled=bool(proc_row.get('IsLocal', False))):
+                    if proc_row.get('IsLocal'):
+                         st.error("Cannot process: Raw data only available on remote server.")
+                    elif not bg_seq:
                         st.error("Please select a background sequence.")
                     else:
                         import subprocess
@@ -388,14 +466,18 @@ def render_dashboard(data_folder, cache_root):
         # User said "Analysis is just a matter of selecting a pre-processed dataset"
         processed_opts = filtered_df[
             (filtered_df["Standard"] == "Processed") | (filtered_df["Dynamic"] == "Processed")
-        ].apply(lambda x: f"{x['Date']} | {x['Sequence']}", axis=1).tolist()
+        ].apply(lambda x: f"{x['Date']} | {x['Description']} ({x['Sequence']})", axis=1).tolist()
         
         sel_load = st.selectbox("Select Dataset to Load", processed_opts, key="load_sel")
         
         if sel_load:
             # Decode selection
-            parts = sel_load.split(" | ")
-            load_row = filtered_df[(filtered_df["Date"] == parts[0]) & (filtered_df["Sequence"] == parts[1])].iloc[0]
+            parts = sel_load.split(" | ", 1)
+            date_val = parts[0]
+            # Format is Description (Sequence)
+            rest = parts[1]
+            seq_val = rest.rsplit(" (", 1)[-1][:-1]
+            load_row = filtered_df[(filtered_df["Date"] == date_val) & (filtered_df["Sequence"] == seq_val)].iloc[0]
             
             st.info(f"Background: {load_row['Background Used']}")
 
@@ -415,7 +497,8 @@ def render_dashboard(data_folder, cache_root):
                     "meas_parent": load_row['Parent'],
                     "meas_seq": load_row['Sequence'],
                     "meas_path": meas_path,
-                    "bg_parent": bg_parent_guess 
+                    "bg_parent": bg_parent_guess,
+                    "description": load_row['Description']
                 }
                 
                 st.rerun()

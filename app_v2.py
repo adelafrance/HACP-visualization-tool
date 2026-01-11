@@ -20,13 +20,25 @@ CALIBRATION_FILE_PATH = os.path.join(SCRIPT_DIR, 'utils', 'angle_model_data.npz'
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
 PIXEL_OFFSET_X = 520
 SESSION_FILE = os.path.join(SCRIPT_DIR, 'session_state.json')
-LOCAL_CACHE_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../output/IPT_WIND_TUNNEL"))
+
+# --- Load Config ---
+DEFAULT_CACHE_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../../output/IPT_WIND_TUNNEL"))
+config_dict = app_utils.load_config(CONFIG_FILE)
+if isinstance(config_dict, str): # Handle legacy string-only config
+    config_dict = {"last_path": config_dict, "cache_path": DEFAULT_CACHE_ROOT}
+elif not config_dict:
+    config_dict = {"last_path": "", "cache_path": DEFAULT_CACHE_ROOT}
+
+LOCAL_CACHE_ROOT = config_dict.get('cache_path', DEFAULT_CACHE_ROOT)
 
 @st.cache_resource
 def load_angle_model():
     return pixel_angle_tool.load_angle_model_from_npz(CALIBRATION_FILE_PATH)
 
 angle_model = load_angle_model()
+
+def set_app_mode(mode):
+    st.session_state.app_mode = mode
 
 # --- Initialize Session State ---
 if 'comparisons' not in st.session_state:
@@ -37,6 +49,20 @@ if 'iterations' not in st.session_state:
     st.session_state.iterations = []
 if 'selected_iter_option' not in st.session_state:
     st.session_state.selected_iter_option = "Average All"
+if 'measurements' not in st.session_state:
+    st.session_state.measurements = {}
+if 'backgrounds' not in st.session_state:
+    st.session_state.backgrounds = {}
+if 'analysis_type' not in st.session_state:
+    st.session_state.analysis_type = "Mueller Matrix"
+
+# Global Session State from File
+p_state = {}
+if os.path.exists(SESSION_FILE):
+    try:
+        with open(SESSION_FILE, 'r') as f: p_state = json.load(f)
+    except: pass
+st.session_state.p_state = p_state
 # --------------------------------
 
 # --- Helper: Handle Dashboard Load Request ---
@@ -55,6 +81,7 @@ if 'target_load' in st.session_state and st.session_state.target_load:
     current_state['meas_parent'] = tl['meas_parent']
     current_state['meas_seq'] = tl['meas_seq']
     if 'meas_path' in tl: current_state['meas_path'] = tl['meas_path']
+    if 'description' in tl: current_state['description'] = tl['description']
     
     if tl.get('bg_parent'): 
         current_state['bg_parent'] = tl['bg_parent']
@@ -73,7 +100,7 @@ if 'target_load' in st.session_state and st.session_state.target_load:
     with open(SESSION_FILE, 'w') as f: json.dump(current_state, f)
     
     # 2. Switch Mode
-    st.session_state.app_mode = "Interactive Analysis"
+    st.session_state.app_mode = tl.get('switch_to_mode', "Interactive Analysis")
     
     # 3. Clear Request & Rerun
     del st.session_state.target_load
@@ -82,7 +109,8 @@ if 'target_load' in st.session_state and st.session_state.target_load:
 # ... (Previous helper functions omitted for brevity, they remain unchanged) ...
 def go_to_previous():
     if 'iterations' in st.session_state and st.session_state.iterations:
-        opts = ["Average All"] + st.session_state.iterations
+        formatted_labels = [f"{app_utils.translate_sequence_name(str(it))} ({it})" for it in st.session_state.iterations]
+        opts = ["Average All"] + formatted_labels
         curr = st.session_state.selected_iter_option
         if curr in opts:
             idx = opts.index(curr)
@@ -91,7 +119,8 @@ def go_to_previous():
 
 def go_to_next():
     if 'iterations' in st.session_state and st.session_state.iterations:
-        opts = ["Average All"] + st.session_state.iterations
+        formatted_labels = [f"{app_utils.translate_sequence_name(str(it))} ({it})" for it in st.session_state.iterations]
+        opts = ["Average All"] + formatted_labels
         curr = st.session_state.selected_iter_option
         if curr in opts:
             idx = opts.index(curr)
@@ -225,9 +254,22 @@ def render_custom_image_view(sel_iter, bg_on, log_thresh, roi_paths):
     """Renders images using a tabbed interface with consolidated controls."""
     if sel_iter not in st.session_state.measurements: return
     
+    # 0. Check if raw data actually exists
+    # If no measurements, show warning and continue (don't return, as we want to keep the UI structure)
+    if sel_iter not in st.session_state.measurements:
+        st.warning("⚠️ **Raw Measurement Data Unavailable**")
+        st.info("No raw images found for this iteration. Plots below are from pre-computed results.")
+        return
+
     meas_dict = st.session_state.measurements[sel_iter]
     bg_dict = st.session_state.backgrounds.get(sel_iter, {}) if bg_on else {}
     
+    first_path = next(iter(meas_dict.values()))
+    if not os.path.exists(first_path):
+        st.warning("⚠️ **Raw Measurement Data Unavailable**")
+        st.info("You are currently in **Local-Only Mode**. Matrix plots and ratios are generated from pre-computed results, but the original source images are not available on this machine.")
+        return
+
     # 1. Load first image to get dimensions for slider
     first_key = next(iter(meas_dict))
     try:
@@ -351,45 +393,40 @@ st.header("HACP Visualization")
 app_mode = st.sidebar.radio("App Mode", ["Data Dashboard", "Interactive Analysis", "Figure Builder"], key="app_mode")
 st.sidebar.divider()
 
+# --- Global Dataset Synchronizer ---
+p_state = st.session_state.get('p_state', {})
+active_meas_path = p_state.get('meas_path')
+active_bg_path = p_state.get('bg_path')
+active_desc = p_state.get('description', "Unknown Dataset")
+active_seq = p_state.get('meas_seq', "Unknown")
 
-
-if app_mode == "Data Dashboard":
-    st.sidebar.title("Configuration")
-    base_data_path = app_utils.load_config(CONFIG_FILE)
-    data_folder = st.sidebar.text_input("Data Root Path", value=base_data_path)
-    if data_folder and os.path.isdir(data_folder) and data_folder != base_data_path:
-         app_utils.save_config(CONFIG_FILE, data_folder)
-    st.sidebar.info("Use the main dashboard panel to manage datasets and processing.")
-
-elif app_mode == "Interactive Analysis":
-    st.sidebar.title("Analysis Setup")
+if app_mode in ["Interactive Analysis", "Figure Builder"]:
+    st.sidebar.markdown(f"**Current Dataset:**\n### {active_desc}")
+    st.sidebar.caption(f"ID: `{active_seq}`")
     
-    # 1. Recover State
-    base_data_path = app_utils.load_config(CONFIG_FILE)
-    p_state = {}
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, 'r') as f: p_state = json.load(f)
-        except: pass
+    is_local_only = active_meas_path and "LOCAL_ONLY:" in active_meas_path
+    
+    if active_meas_path and (os.path.exists(active_meas_path) or is_local_only):
+        if is_local_only:
+             st.sidebar.warning("📁 **Local-Only Mode**")
+             st.sidebar.caption("Using cached results. Raw images unavailable.")
+        else:
+             st.sidebar.success(f"Raw Data Linked")
         
-    # 2. Check for Active Dataset (from Dashboard or Persistence)
-    active_meas_path = p_state.get('meas_path')
-    active_bg_path = p_state.get('bg_path')
-    
-    # If we have a target_load request that hasn't been processed into persistence fully?
-    # The top-level target_load handler (already implemented) updates SESSION_FILE.
-    
-    if active_meas_path and os.path.exists(active_meas_path):
         st.session_state.current_meas_path = active_meas_path
-        st.sidebar.success(f"Loaded: `{os.path.basename(active_meas_path)}`")
         
         # 3. Load Data Logic (Headless)
-        # We need to run this to ensure st.session_state.measurements is populated
         scan_key = f"{active_meas_path}_{active_bg_path}"
         if st.session_state.get('last_scan_key') != scan_key:
+            # Clear stale data to prevent confusion if loading fails
+            st.session_state.measurements = {}
+            st.session_state.backgrounds = {}
+            st.session_state.iterations = [] 
+            
             with st.spinner("Loading measurement data..."):
                 m, b, err = polarimeter_processing.find_and_organize_files(active_meas_path, active_bg_path)
-                if err or not m: m, b, err = app_utils.robust_find_and_organize_files(active_meas_path, active_bg_path)
+                if not m and not is_local_only: 
+                    m, b, err = app_utils.robust_find_and_organize_files(active_meas_path, active_bg_path)
                 
                 if m:
                     st.session_state.measurements, st.session_state.backgrounds = m, b
@@ -401,63 +438,214 @@ elif app_mode == "Interactive Analysis":
                         first_keys = set(m[st.session_state.iterations[0]].keys())
                         if not {'I_PP', 'I_PM', 'I_RP', 'I_RM', 'I_PL', 'I_PR'}.isdisjoint(first_keys):
                             st.session_state.analysis_type = "Mueller Matrix"
-                        elif {'Depol_Parallel', 'Depol_Cross'}.issubset(first_keys):
+                        elif {'Depol_Parallel', 'Depol_Cross', 'Parallel', 'Cross'}.intersection(first_keys):
                             st.session_state.analysis_type = "Depolarization Ratio"
+                elif is_local_only:
+                    st.session_state.last_scan_key = scan_key
                 else:
-                    st.error(f"Failed to load data: {err}")
+                    st.session_state.raw_load_error = err
 
         # 4. Load Precomputed Data (Dynamic/Standard)
-        if st.session_state.get('loaded_meas_path') != active_meas_path:
-             # Default to standard on first load, or auto
+        if st.session_state.get('loaded_meas_path') != active_meas_path or (is_local_only and not st.session_state.iterations):
              load_mode = "dynamic" if st.session_state.get('subtract_wall', False) else "standard"
              pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
              
-             if pre_data: # and pre_meta.get('analysis_type') == st.session_state.get('analysis_type', ''):
-                 # Loose check on analysis type to allow viewing
-                 valid_keys = set(str(i) for i in st.session_state.iterations)
-                 filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys}
-                 st.session_state.precomputed_data = filtered_pre
-                 st.session_state.precomputed_fmt = pre_fmt
-                 st.session_state.analysis_type = pre_meta.get('analysis_type', st.session_state.get('analysis_type', 'Mueller Matrix'))
+             if pre_data:
+                  valid_keys = set(str(i) for i in st.session_state.iterations)
+                  if not valid_keys: # Local only recovery
+                      st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in pre_data.keys()])
+                      filtered_pre = pre_data
+                  else:
+                      filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys}
+                  
+                  st.session_state.precomputed_data = filtered_pre
+                  st.session_state.precomputed_fmt = pre_fmt
+                  # Set type BEFORE widget
+                  st.session_state.analysis_type = pre_meta.get('analysis_type', st.session_state.get('analysis_type', 'Mueller Matrix'))
+                  
+                  if not st.session_state.selected_iter_option in (["Average All"] + st.session_state.iterations):
+                       if st.session_state.iterations:
+                           st.session_state.selected_iter_option = st.session_state.iterations[0]
              else:
-                 st.session_state.precomputed_data = None
+                  st.session_state.precomputed_data = None
              st.session_state.loaded_meas_path = active_meas_path
 
+if app_mode == "Data Dashboard":
+    st.sidebar.title("Configuration")
+    
+    # 1. Raw Data Path
+    base_data_path = config_dict.get('last_path', '')
+    data_folder = st.sidebar.text_input("Raw Data Root Path", value=base_data_path, help="Path to the remote server or local folder containing raw measurement sequences.")
+    
+    # 2. Processed Data Path (Cache)
+    cache_folder = st.sidebar.text_input("Processed Data Path", value=LOCAL_CACHE_ROOT, help="Local directory where preprocessed NetCDF/JSON results are stored.")
+    
+    # Save if changed
+    if (data_folder != base_data_path) or (cache_folder != LOCAL_CACHE_ROOT):
+         new_config = {"last_path": data_folder, "cache_path": cache_folder}
+         app_utils.save_config(CONFIG_FILE, new_config)
+         # We don't necessarily need to rerun, but it ensures LOCAL_CACHE_ROOT is updated globally
+         st.rerun()
+
+    st.sidebar.divider()
+    st.sidebar.info("Use the main dashboard panel to manage datasets and processing.")
+
+elif app_mode == "Interactive Analysis":
+    st.sidebar.title("Analysis Setup")
+    
+    # --- Sidebar Controls ---
+    st.sidebar.title("Analysis Controls")
+    
+    # 1. Analysis Type (Primary Filter)
+    st.sidebar.selectbox("Analysis Type", ["Mueller Matrix", "Depolarization Ratio"], key="analysis_type")
+    st.sidebar.divider()
+
+    # 2. Dataset Quick-Switcher (Filtered by Analysis Type)
+    cached_datasets = app_utils.scan_local_cache(LOCAL_CACHE_ROOT)
+    if cached_datasets:
+        # Filter cached datasets by selected analysis type
+        target_type = st.session_state.analysis_type
+        filtered_cached = [d for d in cached_datasets if app_utils.get_analysis_type_from_sequence(d['Sequence']) == target_type]
+        
+        if filtered_cached:
+            # Human-readable options
+            cached_opts = [f"{d['Date']} | {app_utils.translate_sequence_name(d['Sequence'])} ({d['Sequence']})" for d in filtered_cached]
+            
+            # Find current in filtered
+            curr_idx = 0
+            if active_seq:
+                for i, d in enumerate(filtered_cached):
+                    if d['Sequence'] == active_seq:
+                        curr_idx = i
+                        break
+            
+            sel_switch = st.sidebar.selectbox("Jump to Dataset", cached_opts, index=curr_idx, key="sidebar_switcher")
+            
+            if sel_switch:
+                target_d = filtered_cached[cached_opts.index(sel_switch)]
+                if active_seq != target_d['Sequence']:
+                    # Reset comparisons and other state
+                    st.session_state.comparisons = []
+                    # trigger reload by setting target_load
+                    st.session_state.target_load = {
+                        "date": target_d['Date'],
+                        "meas_parent": os.path.basename(os.path.dirname(os.path.dirname(target_d['LocalPath']))),
+                        "meas_seq": target_d['Sequence'],
+                        "meas_path": target_d['LocalPath'],
+                        "description": app_utils.translate_sequence_name(target_d['Sequence'])
+                    }
+                    st.rerun()
+        else:
+            st.sidebar.info(f"No cached {target_type} datasets.")
+    
+    st.sidebar.divider()
+    
+    if active_meas_path and (os.path.exists(active_meas_path) or is_local_only):
         if st.session_state.get('precomputed_data'):
             fmt = st.session_state.get('precomputed_fmt', 'Data')
-            st.success(f"Pre-computed: {len(st.session_state.precomputed_data)} steps")
+            st.success(f"Pre-computed results loaded: {len(st.session_state.precomputed_data)} steps.")
+            
+            # Check if we should mention raw data failure
+            if st.session_state.get('raw_load_error') and not is_local_only:
+                st.info(f"💡 **Limited Mode**: Raw data unavailable ({st.session_state.raw_load_error}). Viewing cached results only.")
+            
             st.session_state.use_precomputed = st.checkbox("Use pre-computed results", value=True)
-
-        if st.sidebar.button("Change Dataset", icon="🔄"):
-            st.session_state.app_mode = "Data Dashboard"
-            st.rerun()
-
+        elif st.session_state.get('raw_load_error'):
+            # Only show as red error if we have NO precomputed data either
+            st.error(f"❌ **Loading Failed**: {st.session_state.raw_load_error}")
+        elif not is_local_only and not st.session_state.get('measurements'):
+             st.warning("⚠️ No data found at the specified path.")
     else:
         st.sidebar.warning("No dataset loaded.")
-        if st.sidebar.button("Go to Dashboard"):
-            st.session_state.app_mode = "Data Dashboard"
+        if st.sidebar.button("Go to Dashboard", on_click=set_app_mode, args=("Data Dashboard",)):
             st.rerun()
 
-    # Analysis Type Override
-    st.sidebar.divider()
-    curr_type = st.session_state.get('analysis_type', 'Mueller Matrix')
-    st.sidebar.selectbox("Analysis Type", ["Mueller Matrix", "Depolarization Ratio"], index=0 if curr_type == "Mueller Matrix" else 1, key="analysis_type")
-
-    # Comparisons (Simplified for now - can re-enable full scan if needed)
+    # Comparisons
     with st.sidebar.expander("Comparisons"):
-        st.info("To add comparisons, please ensure the Data Root Path is set correctly.")
-        # Logic to scan folders for comparison addition could go here if requested.
-        pass
-    
+        all_cached = app_utils.scan_local_cache(LOCAL_CACHE_ROOT)
+        
+        # Filter cached datasets by CURRENT SELECTED analysis type
+        target_type = st.session_state.analysis_type
+        comp_cached = [d for d in all_cached if app_utils.get_analysis_type_from_sequence(d['Sequence']) == target_type]
+            
+        if comp_cached:
+            cached_opts = [f"{d['Date']} | {app_utils.translate_sequence_name(d['Sequence'])} ({d['Sequence']})" for d in comp_cached]
+            sel_cached = st.selectbox("Select Dataset to Contrast", cached_opts, key="interactive_comp_cache_sel")
+            
+            if st.button("Add as Comparison", use_container_width=True):
+                d_idx = cached_opts.index(sel_cached)
+                target_d = comp_cached[d_idx]
+                
+                # Try to load precomputed data
+                pre_data, _, _ = app_utils.try_load_precomputed(target_d['LocalPath'])
+                if pre_data:
+                    # Avoid duplicates
+                    existing_names = [c['name'] for c in st.session_state.comparisons]
+                    if target_d['Sequence'] not in existing_names:
+                        desc = app_utils.translate_sequence_name(target_d['Sequence'])
+                        st.session_state.comparisons.append({
+                            'name': target_d['Sequence'],
+                            'description': desc,
+                            'precomputed_data': pre_data
+                        })
+                        st.success(f"Added {target_d['Sequence']}")
+                        st.rerun()
+                    else:
+                        st.warning("Comparison already added.")
+                else:
+                    st.error("Failed to load preprocessed data.")
+        else:
+            st.info(f"No matching {target_type} datasets found.")
+
+        if st.session_state.comparisons:
+            st.divider()
+            st.write(f"**Active Comparisons ({len(st.session_state.comparisons)})**")
+            for i, comp in enumerate(st.session_state.comparisons):
+                st.caption(f"• {comp['name']}")
+            
+            if st.button("Clear All Comparisons", type="secondary", use_container_width=True):
+                st.session_state.comparisons = []
+                st.rerun()
+
+    st.sidebar.divider()
+    if st.sidebar.button("Back to Dashboard", icon="🏠", on_click=set_app_mode, args=("Data Dashboard",)):
+        st.rerun()
+
 # --- Main Panel ---
 if app_mode == "Data Dashboard":
     dashboard.render_dashboard(base_data_path, LOCAL_CACHE_ROOT)
     st.stop()
 
 if app_mode == "Figure Builder":
+    # --- Safety Net for Local-Only Iteration Recovery ---
+    if not st.session_state.get('iterations') and st.session_state.get('precomputed_data'):
+         pre = st.session_state.precomputed_data
+         st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in pre.keys()])
+
     from utils import figure_composer
-    figure_composer.render_figure_composer(st.session_state.measurements)
+    figure_composer.render_figure_composer(st.session_state.measurements, LOCAL_CACHE_ROOT)
     st.stop()
+
+# --- Safety Net for Local-Only Iteration Recovery ---
+# If iterations were cleared (e.g. by scan logic) but we have precomputed data, recover them now.
+# This MUST happen before the `if ... iterations:` check below.
+if not st.session_state.get('iterations') and st.session_state.get('precomputed_data'):
+     pre = st.session_state.precomputed_data
+     st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in pre.keys()])
+     if st.session_state.iterations:
+         # Ensure a valid selection exists
+         # formatting matches the loop below
+         current_sel = st.session_state.get('selected_iter_option')
+         
+         # If current selection is invalid or missing, default to the first iteration
+         # But we must format it exactly as the widget expects: "Description (ID)"
+         # We can't easily check "if current_sel not in options" because options aren't built yet.
+         # So we'll check if it's "Average All" or if it LOOKS roughly valid. 
+         # Actually, simpler: if it's not set or likely invalid (e.g. integer), set it to the formatted first iter.
+         if not current_sel or (isinstance(current_sel, int)) or (isinstance(current_sel, str) and "(" not in current_sel and current_sel != "Average All"):
+              first_it = st.session_state.iterations[0]
+              desc = app_utils.translate_sequence_name(str(first_it))
+              st.session_state.selected_iter_option = f"{desc} ({first_it})"
 
 if 'iterations' in st.session_state and st.session_state.iterations:
     controls = st.container(border=True)
@@ -466,13 +654,28 @@ if 'iterations' in st.session_state and st.session_state.iterations:
     r1_c1, r1_c2 = controls.columns([0.5, 0.5])
     
     with r1_c1:
+
         iter_cols = st.columns([0.2, 0.6, 0.2])
-        iter_opts = ["Average All"] + st.session_state.iterations
-        sel_iter = iter_cols[1].selectbox("Iteration", iter_opts, key="selected_iter_option", label_visibility="collapsed")
+        # Format labels with descriptions
+        formatted_labels = []
+        for it in st.session_state.iterations:
+            desc = app_utils.translate_sequence_name(str(it))
+            formatted_labels.append(f"{desc} ({it})")
+            
+        iter_opts = ["Average All"] + formatted_labels
+        sel_iter_label = iter_cols[1].selectbox("Iteration", iter_opts, key="selected_iter_option", label_visibility="collapsed")
+        
+        # Decode selection
+        if sel_iter_label == "Average All":
+            sel_iter = "Average All"
+        else:
+            # Extract ID from "Description (ID)" - use rsplit to handle descriptions with (
+            sel_iter = sel_iter_label.rsplit(" (", 1)[-1][:-1]
+            
         is_avg = sel_iter == "Average All"
         
         if not is_avg:
-            curr_idx = iter_opts.index(sel_iter)
+            curr_idx = iter_opts.index(sel_iter_label)
             iter_cols[0].button("Previous", use_container_width=True, disabled=(curr_idx <= 1), on_click=go_to_previous)
             iter_cols[2].button("Next", use_container_width=True, disabled=(curr_idx >= len(iter_opts) - 1), on_click=go_to_next)
             
@@ -491,6 +694,7 @@ if 'iterations' in st.session_state and st.session_state.iterations:
     
     with p_cols[3]:
         subtract_wall = st.toggle("Subtract Wall Effect", value=False, key="subtract_wall")
+        show_std = st.toggle("Show Standard Deviation", value=True, key="show_std_toggle")
         # Only show method selector if wall subtraction is on
         wall_method = "dynamic" # Static method is removed.
 
@@ -509,6 +713,13 @@ if 'iterations' in st.session_state and st.session_state.iterations:
             if new_data:
                 st.session_state.precomputed_data = new_data
                 st.session_state.loaded_mode = target_mode
+                
+                # RECOVER ITERATIONS: If we are in local-only mode or iterations were cleared, we must populate them from the new data
+                if not st.session_state.iterations:
+                    st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in new_data.keys()])
+                    # Reset selection to first available if needed
+                    if st.session_state.iterations and st.session_state.selected_iter_option not in (["Average All"] + st.session_state.iterations):
+                         st.session_state.selected_iter_option = st.session_state.iterations[0]
 
     # --- Calculation ---
     final_results, curves_to_show, roi_paths_to_show = {}, {}, {}
@@ -524,62 +735,142 @@ if 'iterations' in st.session_state and st.session_state.iterations:
         if is_avg:
             all_res = defaultdict(list)
             for d in pre.values():
-                for k, v in d.items(): all_res[k].append(v)
+                for k, v in d.items(): 
+                    # Keys might be stored as 'S33/S11' but processed expects 'S33_div_S11' or similar?
+                    # No, try_load_precomputed maps them back to '/'
+                    all_res[k].append(v)
+            if all_res:
+                for k, v in all_res.items(): 
+                    final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
+        else:
+            iter_key = str(sel_iter) if str(sel_iter) in pre else sel_iter
+            if iter_key in pre:
+                raw_res = pre[iter_key]
+                for k, v in raw_res.items():
+                    final_results[k] = {'mean': v}
 
     # 2. Calculate if missing
     if not final_results:
-        if is_avg:
-            all_res = defaultdict(list)
-            prog = st.progress(0)
-            for i, it in enumerate(st.session_state.iterations):
-                curves, _ = app_computation.calculate_curves_for_iteration(it, st.session_state.measurements, st.session_state.backgrounds, req_meas, analysis_type, bg_on, noise_sigma, 10**(-log_thresh), angle_model, subtract_wall)
-                if curves:
+        # Check if we HAVE measurements to calculate from
+        has_meas = len(st.session_state.get('measurements', {})) > 0
+        
+        if has_meas:
+            if is_avg:
+                all_res = defaultdict(list)
+                prog = st.progress(0, text="Averaging iterations...")
+                for i, it in enumerate(st.session_state.iterations):
+                    res_tuple = app_computation.calculate_curves_for_iteration(it, st.session_state.measurements, st.session_state.backgrounds, req_meas, analysis_type, bg_on, noise_sigma, 10**(-log_thresh), angle_model, subtract_wall)
+                    if res_tuple:
+                        curves, _ = res_tuple
+                        if curves:
+                            if analysis_type == "Mueller Matrix":
+                                m = polarimeter_processing.calculate_mueller_elements(curves)
+                                if m: 
+                                    for k, v in m.items(): all_res[k].append(v)
+                            else:
+                                if 'Depol_Parallel' in curves:
+                                    dep = (curves['Depol_Cross']+1e-9)/(curves['Depol_Parallel']+1e-9)
+                                    all_res['Depolarization Ratio'].append(dep)
+                                    all_res['Depol_Parallel'].append(curves['Depol_Parallel'])
+                                    all_res['Depol_Cross'].append(curves['Depol_Cross'])
+                        prog.progress((i+1)/len(st.session_state.iterations))
+                if all_res:
+                    for k, v in all_res.items(): 
+                        final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
+            else:
+                res_tuple = app_computation.calculate_curves_for_iteration(sel_iter, st.session_state.measurements, st.session_state.backgrounds, req_meas, analysis_type, bg_on, noise_sigma, 10**(-log_thresh), angle_model, subtract_wall)
+                if res_tuple:
+                    curves, roi_paths = res_tuple
+                    roi_paths_to_show = roi_paths
+                    curves_to_show = curves
+                    res = {}
                     if analysis_type == "Mueller Matrix":
                         m = polarimeter_processing.calculate_mueller_elements(curves)
-                        if m: 
-                            for k, v in m.items(): all_res[k].append(v)
+                        if m: res = m
                     else:
                         if 'Depol_Parallel' in curves:
-                            dep = (curves['Depol_Cross']+1e-9)/(curves['Depol_Parallel']+1e-9)
-                            all_res['Depolarization Ratio'].append(dep)
-                            all_res['Depol_Parallel'].append(curves['Depol_Parallel'])
-                            all_res['Depol_Cross'].append(curves['Depol_Cross'])
-                prog.progress((i+1)/len(st.session_state.iterations))
-            for k, v in all_res.items(): final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
-        else:
-            curves, roi_paths = app_computation.calculate_curves_for_iteration(sel_iter, st.session_state.measurements, st.session_state.backgrounds, req_meas, analysis_type, bg_on, noise_sigma, 10**(-log_thresh), angle_model, subtract_wall)
-            if curves:
-                roi_paths_to_show = roi_paths
-                curves_to_show = curves
-                res = {}
-                if analysis_type == "Mueller Matrix":
-                    m = polarimeter_processing.calculate_mueller_elements(curves)
-                    if m: res = m
-                else:
-                    if 'Depol_Parallel' in curves:
-                        res['Depolarization Ratio'] = (curves['Depol_Cross']+1e-9)/(curves['Depol_Parallel']+1e-9)
-                        res['Depol_Parallel'] = curves['Depol_Parallel']
-                        res['Depol_Cross'] = curves['Depol_Cross']
-                
-                if res:
-                    for k, v in res.items(): final_results[k] = {'mean': v}
-                    # Auto-save
+                            res['Depolarization Ratio'] = (curves['Depol_Cross']+1e-9)/(curves['Depol_Parallel']+1e-9)
+                            res['Depol_Parallel'] = curves['Depol_Parallel']
+                            res['Depol_Cross'] = curves['Depol_Cross']
+                    final_results = res
+                    
+                    # Auto-save newly computed single iteration
                     if st.session_state.get('precomputed_data') is None: st.session_state.precomputed_data = {}
-                    if str(sel_iter) not in st.session_state.precomputed_data:
-                        st.session_state.precomputed_data[str(sel_iter)] = res
-                        meta = {"source_path": st.session_state.current_meas_path, "analysis_type": analysis_type, "parameters": {"bg_subtraction": bg_on, "subtract_wall": subtract_wall}}
-                        is_dynamic_run = subtract_wall
-                        app_utils.save_precomputed_data(st.session_state.current_meas_path, st.session_state.precomputed_data, meta, fmt=export_fmt, local_cache_root=LOCAL_CACHE_ROOT, is_dynamic=is_dynamic_run)
+                    st.session_state.precomputed_data[str(sel_iter)] = res
+                    meta = {"source_path": st.session_state.current_meas_path, "analysis_type": analysis_type, "parameters": {"bg_subtraction": bg_on, "subtract_wall": subtract_wall}}
+                    export_fmt = st.session_state.get('export_fmt', 'NetCDF')
+                    app_utils.save_precomputed_data(st.session_state.current_meas_path, st.session_state.precomputed_data, meta, fmt=export_fmt, local_cache_root=LOCAL_CACHE_ROOT, is_dynamic=subtract_wall)
+        else:
+            if not st.session_state.get('precomputed_data'):
+                st.warning("⚠️ **No data to display.**")
+                st.info("Raw measurement folders are missing or unreachable, and no pre-computed results were found for this dataset.")
+                st.stop()
+            else:
+                # Precomputed data exists, but we failed to extract results for THIS iteration/settings
+                if not final_results:
+                     avail_keys = list(st.session_state.precomputed_data.keys())
+                     if subtract_wall:
+                         st.warning(f"⚠️ **Wall-Subtracted Data Unavailable for {sel_iter}**")
+                         st.info(f"The 'Subtract Wall Effect' dataset is loaded, but it does not contain data for iteration **{sel_iter}**.")
+                         st.caption(f"**Diagnostic Info:**\nRequested: `{sel_iter}` (Type: {type(sel_iter).__name__})\nAvailable in File: `{avail_keys}`")
+                         st.markdown("👉 **Try disabling 'Subtract Wall Effect'** to see the standard processed data.")
+                     else:
+                         st.warning(f"⚠️ **Data Unavailable for {sel_iter}**")
+                         st.info(f"Pre-computed results are loaded, but no data was found for iteration **{sel_iter}**. It might have been skipped during processing.")
+                         st.caption(f"**Diagnostic Info:**\nRequested: `{sel_iter}`\nAvailable: `{avail_keys}`")
+                     st.stop()
+
+                st.info("💡 Pro-tip: Ensure 'Use pre-computed results' is checked if raw images are missing.")
+                # We already loaded precomputed data into final_results in Step 1 if available
+
 
     # --- Plotting ---
     if final_results:
         ref_w = list(final_results.values())[0]['mean'].shape[0]
         x_angles = angle_model(np.arange(ref_w) + PIXEL_OFFSET_X)
         
-        # Angle Slider
+        # Angle Selection (Synchronized Slider + Numeric Inputs)
         if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 168.0)
+        curr_low, curr_high = st.session_state.angle_range
         min_a, max_a = float(x_angles.min()), float(x_angles.max())
-        st.session_state.angle_range = st.slider("Angle Range", min_a, max_a, st.session_state.angle_range, help="Range of scattering angles to display.")
+
+        # Callbacks for sync
+        def _sync_from_slider_ia():
+            low, high = st.session_state.angle_range_slider_ia
+            st.session_state.angle_min_ia = int(low)
+            st.session_state.angle_max_ia = int(high)
+            st.session_state.angle_range = (float(low), float(high))
+
+        def _sync_from_inputs_ia():
+            low = st.session_state.angle_min_ia
+            high = st.session_state.angle_max_ia
+            st.session_state.angle_range_slider_ia = (float(low), float(high))
+            st.session_state.angle_range = (float(low), float(high))
+
+        # Ensure widget keys are in sync with global state and CLAMPED to current data bounds
+        # Use floor/ceil or float clamping to avoid "value below min" due to int truncation
+        clamped_low = max(min_a, min(max_a, float(curr_low)))
+        clamped_high = max(min_a, min(max_a, float(curr_high)))
+        
+        if st.session_state.get('angle_min_ia') != int(clamped_low): 
+            st.session_state.angle_min_ia = int(np.ceil(clamped_low)) if clamped_low > int(clamped_low) else int(clamped_low)
+        if st.session_state.get('angle_max_ia') != int(clamped_high): 
+            st.session_state.angle_max_ia = int(clamped_high)
+        
+        # Slider MUST be floats within [min_a, max_a]
+        s_low = max(min_a, float(st.session_state.angle_min_ia))
+        s_high = min(max_a, float(st.session_state.angle_max_ia))
+        
+        if st.session_state.get('angle_range_slider_ia') != (s_low, s_high):
+            st.session_state.angle_range_slider_ia = (s_low, s_high)
+
+        ac1, ac2, ac3 = st.columns([0.4, 0.3, 0.3])
+        ac2.number_input("Min Angle [deg]", int(min_a), int(max_a), step=1, key="angle_min_ia", on_change=_sync_from_inputs_ia)
+        ac3.number_input("Max Angle [deg]", int(min_a), int(max_a), step=1, key="angle_max_ia", on_change=_sync_from_inputs_ia)
+        ac1.slider("Angle Range", min_a, max_a, key="angle_range_slider_ia", on_change=_sync_from_slider_ia, help="Range of scattering angles to display.")
+        
+        # Final sync
+        st.session_state.angle_range = (float(st.session_state.angle_min_ia), float(st.session_state.angle_max_ia))
         
         def get_yrange(y_data_list):
             mask = (x_angles >= st.session_state.angle_range[0]) & (x_angles <= st.session_state.angle_range[1])
@@ -604,14 +895,25 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                 configs = {"S11": "#1f77b4", "DoLP": "#1f77b4", "S12/S11": "#1f77b4", "S33/S11": "#1f77b4", "S34/S11": "#1f77b4"}
                 for key, color in configs.items():
                     if key in final_results:
-                        fig = go.Figure()
                         mean = final_results[key]['mean']
+                        
+                        # Add Standard Deviation if requested
+                        y_err_primary = None
+                        if show_std and is_avg and 'std' in final_results[key]:
+                             y_err_primary = final_results[key]['std']
+                             
+                        fig = plotting.create_line_figure(
+                            x_angles, mean, y_err=y_err_primary, 
+                            name='Primary', color=color,
+                            style=plotting.STYLES["Default"],
+                            y_log=(y_scale == "Log" and key == 'S11')
+                        )
+                        
                         y_stack = [mean]
                         
-                        # Comparisons
                         for i, comp in enumerate(st.session_state.comparisons):
                             # Logic to get comparison data (precomputed or calculated)
-                            c_res = {}
+                            c_res = None
                             if comp.get('precomputed_data'):
                                 d = comp['precomputed_data']
                                 if is_avg:
@@ -619,10 +921,6 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                     if vals: c_res = np.mean(vals, axis=0)
                                 else:
                                     c_res = d.get(str(sel_iter), {}).get(key)
-                            
-                            if c_res is None: # Fallback calc
-                                # (Simplified for brevity: assume precomputed mostly used or add calc logic here)
-                                pass
                             
                             if c_res is not None:
                                 c_plot = c_res.copy()
@@ -632,12 +930,12 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                     if c_max != 0: 
                                         c_plot *= (p_max/c_max)
                                         suffix = f" (x{p_max/c_max:.2f})"
-                                label = app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements'))
+                                label = comp.get('description', app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements')))
                                 color_c = comp_colors[i % len(comp_colors)]
                                 fig.add_trace(go.Scatter(x=x_angles, y=c_plot, mode='lines', line=dict(color=color_c), name=f"{label}{suffix}"))
                                 y_stack.append(c_plot)
 
-                        fig.add_trace(go.Scatter(x=x_angles, y=mean, mode='lines', line=dict(color=color), name='Primary'))
+                        # Primary already added by create_line_figure
                         
                         if y_scale == "Log" and key == 'S11':
                             fig.update_yaxes(type="log", exponentformat="e")
@@ -675,6 +973,7 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                     if 'S11' in it_d and 'S12' in it_d:
                                         c_res = (it_d['S11'] - it_d['S12'])/2.0 if "PV" in plot_label else (it_d['S11'] + it_d['S12'])/2.0
                             
+                            # Note: Comparisons don't have shaded Std for now to keep it clean.
                             if c_res is not None:
                                 c_plot = c_res.copy()
                                 suffix = ""
@@ -683,10 +982,18 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                     if c_max != 0:
                                         c_plot *= (p_max/c_max)
                                         suffix = f" (x{p_max/c_max:.2f})"
-                                label = app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements'))
+                                label = comp.get('description', app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements')))
                                 color_c = comp_colors[i % len(comp_colors)]
                                 fig.add_trace(go.Scatter(x=x_angles, y=c_plot, mode='lines', line=dict(color=color_c), name=f"{label}{suffix}"))
                                 y_stack.append(c_plot)
+
+                        # Primary with Shading
+                        y_err = None
+                        if show_std and is_avg:
+                            # Derived PV/PH std is a bit complex, let's approximate or just skip if too heavy.
+                            # But wait, final_results only has Sij.
+                            # Let's Skip shading for derived PV/PH for now to be safe, or implement if easy.
+                            pass
 
                         fig.add_trace(go.Scatter(x=x_angles, y=data, mode='lines', line=dict(color=color), name='Primary'))
                         
@@ -712,8 +1019,19 @@ if 'iterations' in st.session_state and st.session_state.iterations:
             t1, t2, t3 = st.tabs(["Ratio", "Images", "Background Images"])
             with t1:
                 if 'Depolarization Ratio' in final_results:
-                    fig = go.Figure()
                     mean = final_results['Depolarization Ratio']['mean']
+                    
+                    y_err_primary = None
+                    if show_std and is_avg and 'std' in final_results['Depolarization Ratio']:
+                        y_err_primary = final_results['Depolarization Ratio']['std']
+
+                    fig = plotting.create_line_figure(
+                        x_angles, mean, y_err=y_err_primary, 
+                        name='Primary', color="#1f77b4",
+                        style=plotting.STYLES["Default"],
+                        y_log=(y_scale == "Log")
+                    )
+                    
                     y_stack = [mean]
                     
                     for i, comp in enumerate(st.session_state.comparisons):
@@ -734,13 +1052,11 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                 if c_max != 0:
                                     c_plot *= (p_max/c_max)
                                     suffix = f" (x{p_max/c_max:.2f})"
-                            label = app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements'))
+                            label = comp.get('description', app_utils.get_smart_label(comp['name'], st.session_state.measurements, comp.get('measurements')))
                             color_c = comp_colors[i % len(comp_colors)]
                             fig.add_trace(go.Scatter(x=x_angles, y=c_plot, mode='lines', line=dict(color=color_c), name=f"{label}{suffix}"))
                             y_stack.append(c_plot)
 
-                    fig.add_trace(go.Scatter(x=x_angles, y=mean, mode='lines', line=dict(color="#1f77b4"), name='Primary'))
-                    
                     if y_scale == "Log":
                         fig.update_yaxes(type="log", exponentformat="e")
                     else:
@@ -784,3 +1100,15 @@ if 'iterations' in st.session_state and st.session_state.iterations:
 
             with t3:
                 app_visualization.render_background_images_tab(st.session_state.backgrounds, st.session_state.comparisons, req_meas, bg_on)
+    # DEBUG SECTION (Moved to Bottom)
+    st.divider()
+    with st.expander("Debug Info (App V2)", expanded=False):
+        st.write(f"Subtract Wall: {subtract_wall}")
+        st.write(f"Precomputed Data Loaded: {bool(st.session_state.get('precomputed_data'))}")
+        if st.session_state.get('precomputed_data'):
+            keys = list(st.session_state.precomputed_data.keys())
+            st.write(f"Precomputed Keys (First 5): {keys[:5]}")
+            st.write(f"Precomputed Keys (Types): {[type(k).__name__ for k in keys[:5]]}")
+        st.write(f"Selected Iteration: {sel_iter} (Type: {type(sel_iter).__name__})")
+        st.write(f"Final Results Empty?: {not bool(final_results)}")
+        st.json(final_results)

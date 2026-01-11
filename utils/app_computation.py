@@ -24,8 +24,16 @@ def calculate_curves_for_iteration(iteration, measurements, backgrounds, require
     missing_files = [m for m in required_meas if m not in iter_files]
     if missing_files: return None
 
-    ref_meas_type = 'I_PV' if analysis_type == "Mueller Matrix" else 'Depol_Parallel'
-    if ref_meas_type not in iter_files: return None
+    ref_meas_type = None
+    if analysis_type == "Mueller Matrix":
+        ref_meas_type = 'I_PV'
+    else:
+        # Flexible check for Depolarization reference
+        for k in ['Depol_Parallel', 'Parallel']:
+            if k in iter_files:
+                ref_meas_type = k; break
+    
+    if not ref_meas_type or ref_meas_type not in iter_files: return None
 
     pil_img = robust_load_image(iter_files[ref_meas_type])
     if pil_img is None: return None

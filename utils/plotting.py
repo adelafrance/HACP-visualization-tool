@@ -46,6 +46,7 @@ class FigureStyle:
 STYLES = {
     "Default": FigureStyle(),
     "Journal": FigureStyle(font_family="Times New Roman", font_size=14, background_color="white", grid_color="black"),
+    "Publication": FigureStyle(font_family="Arial", font_size=14, background_color="white", grid_color="lightgrey"),
     "Presentation": FigureStyle(font_family="Arial", font_size=18, background_color="white", grid_color="dimgrey")  
 }
 
@@ -70,16 +71,20 @@ def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", 
     style.apply_to_mpl(ax)
     return im
 
-def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, linestyle="-", ylim=None):
+def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, disable_sci_y=False, linestyle="-", ylim=None, internal_label=None, scale_factor=1.0):
     """Matplotlib Line Plot on a specific Axes."""
     if style is None: style = STYLES["Default"]
     
+    # Apply Scaling
+    y_scaled = y_data * scale_factor
+    y_err_scaled = y_err * scale_factor if y_err is not None else None
+
     # Plot Mean Curve
-    ax.plot(x_data, y_data, label=label, color=color, linewidth=2, linestyle=linestyle)
+    ax.plot(x_data, y_scaled, label=label, color=color, linewidth=2, linestyle=linestyle)
     
     # Plot Standard Deviation / Error
-    if y_err is not None:
-        ax.fill_between(x_data, y_data - y_err, y_data + y_err, color=color, alpha=0.3, label=f"{label} ±Std")
+    if y_err_scaled is not None:
+        ax.fill_between(x_data, y_scaled - y_err_scaled, y_scaled + y_err_scaled, color=color, alpha=0.3, label=f"{label} ±Std")
     
     if y_log: ax.set_yscale('log')
     
@@ -87,9 +92,14 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
+    # Internal Panel Label (Top Left)
+    if internal_label:
+        ax.text(0.02, 0.96, internal_label, transform=ax.transAxes, 
+                verticalalignment='top', fontweight='bold', 
+                fontsize=style.font_size, family=style.font_family,
+                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1))
+
     # Handle Axis Visibility vs Tick Visibility
-    # If not show_x, we want Ticks visible but Labels hidden?
-    # Usually in shared plots: yes.
     if not show_x:
         ax.tick_params(axis='x', labelbottom=False)
     
@@ -100,10 +110,13 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
     try:
         if not disable_sci_x:
             ax.ticklabel_format(style='sci', scilimits=(0,0), axis='x')
+        else:
+            ax.ticklabel_format(style='plain', axis='x')
         
-        # Always Sci on Y unless specified? User said "Scattering angle... should just be a normal number". 
-        # So keep Y as sci unless otherwise requested (default behavior).
-        ax.ticklabel_format(style='sci', scilimits=(0,0), axis='y')
+        if not disable_sci_y:
+            ax.ticklabel_format(style='sci', scilimits=(0,0), axis='y')
+        else:
+            ax.ticklabel_format(style='plain', axis='y')
     except (AttributeError, ValueError):
         pass # Log scale or incompatible formatter
         
@@ -210,16 +223,40 @@ def create_heatmap_figure(img_float, cmap_name="Viridis", zero_mode="Default", z
     
     return fig
 
-def create_line_figure(x_data, y_data, name="Data", title="", style=None, xlabel="", ylabel="", color=None, show_x_label=True, show_y_label=True, y_log=False):
-    """Generates a line plot figure."""
+def create_line_figure(x_data, y_data, y_err=None, name="Data", title="", style=None, xlabel="", ylabel="", color=None, show_x_label=True, show_y_label=True, y_log=False):
+    """Generates a line plot figure with optional shaded error bands."""
     if style is None: style = STYLES["Default"]
+    base_color = color if color else "#1f77b4"
     
     fig = go.Figure()
+    
+    # 1. Error Band (Shaded)
+    if y_err is not None:
+        # We use a single trace with a 'toself' fill for the shaded region
+        # Coordinates: [x_data forward, x_data backward], [y+err forward, y-err backward]
+        x_err = np.concatenate([x_data, x_data[::-1]])
+        y_upper = y_data + y_err
+        y_lower = y_data - y_err
+        y_err_combined = np.concatenate([y_upper, y_lower[::-1]])
+        
+        # Convert to list or handle NaNs for Plotly
+        fig.add_trace(go.Scatter(
+            x=x_err,
+            y=y_err_combined,
+            fill='toself',
+            fillcolor=f"rgba{tuple(list(mcolors.to_rgb(base_color)) + [0.2])}",
+            line=dict(color='rgba(255,255,255,0)'),
+            hoverinfo="skip",
+            showlegend=True,
+            name=f"{name} ±Std"
+        ))
+
+    # 2. Mean Line
     fig.add_trace(go.Scatter(
         x=x_data, y=y_data, 
         mode='lines', 
         name=name,
-        line=dict(color=color if color else "#1f77b4", width=2)
+        line=dict(color=base_color, width=2)
     ))
     
     layout_args = dict(
