@@ -106,6 +106,9 @@ def run_batch_process(measurements, backgrounds, iterations, precomputed_data, a
                 else:
                     if 'Depol_Parallel' in curves and 'Depol_Cross' in curves:
                         iter_res['Depolarization Ratio'] = (curves['Depol_Cross'] + 1e-9) / (curves['Depol_Parallel'] + 1e-9)
+                        # Save components to enable "Ratio of Means" smoothing downstream
+                        iter_res['Depol_Parallel'] = curves['Depol_Parallel']
+                        iter_res['Depol_Cross'] = curves['Depol_Cross']
                 if iter_res: current_data[iter_key] = iter_res
         
         # Incremental Save (Every 10 iterations)

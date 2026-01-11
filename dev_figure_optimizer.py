@@ -29,7 +29,7 @@ st.info = lambda *a: print(f"INFO: {a}")
 from utils import figure_composer, app_utils, polarimeter_processing
 
 # --- CONFIGURATION ---
-TEST_CASE = "MATRIX" # "DEPOL" or "MATRIX"
+TEST_CASE = "DEPOL" # "DEPOL" or "MATRIX"
 
 PATHS = {
     "DEPOL": "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/20251209/preprocessed_data/test_01_steps7to8_exp0_25s_gain0dB",

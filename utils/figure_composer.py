@@ -119,7 +119,12 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
             elif t_var == "S33/S11": ratio_components = ("S33", "S11")
             elif t_var == "S34/S11": ratio_components = ("S34", "S11")
             elif t_var == "DoLP": ratio_components = ("DoLP_Num", "S11") # Special case requires |S12| check
-            
+            elif t_var == "Depolarization Ratio": 
+                 # Depolarization Ratio = Cross / Parallel
+                 # Use Ratio of Means (Sum(Cross)/Sum(Para)) for smoothness
+                 ratio_components = ("Depol_Cross" if "Depol_Cross" in iter_res else "Cross", 
+                                     "Depol_Parallel" if "Depol_Parallel" in iter_res else "Parallel")
+
             # Special DoLP handling if keys missing
             if t_var == "DoLP" and "DoLP" in iter_res:
                 # Use pre-calculated DoLP if available (simple case)
@@ -140,7 +145,12 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                      # We reuse t_curves to store tuples if ratio mode
                      y_val = (num_val, den_val)
                 else:
-                     y_val = None
+                     # FALLBACK: If components are missing (e.g. old cache), use the pre-calculated value
+                     # This results in "Mean of Ratios" (rougher) but is better than a blank plot.
+                     if t_var == "Depolarization Ratio" and t_var in iter_res:
+                         y_val = iter_res[t_var]
+                     else:
+                         y_val = None
             
             # Standard single variable handling
             elif t_var in iter_res: y_val = iter_res[t_var]
