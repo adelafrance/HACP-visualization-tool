@@ -29,7 +29,7 @@ st.info = lambda *a: print(f"INFO: {a}")
 from utils import figure_composer, app_utils, polarimeter_processing
 
 # --- CONFIGURATION ---
-TEST_CASE = "DEPOL" # Options: "DEPOL", "MATRIX"
+TEST_CASE = "MATRIX" # "DEPOL" or "MATRIX"
 
 PATHS = {
     "DEPOL": "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/20251209/preprocessed_data/test_01_steps7to8_exp0_25s_gain0dB",
@@ -157,7 +157,7 @@ def load_data():
 
 def build_specs_depol():
     layout_type = "Single Panel"
-    width, height = 8, 5
+    width, height = 10, 4.0
     unit = "inch"
     
     angle_range = (100, 167)
@@ -182,12 +182,12 @@ def build_specs_depol():
 
 def build_specs_matrix():
     layout_type = "2x2 Grid"
-    width, height = 12, 10
+    width, height = 10, 6.5
     unit = "inch"
     
     angle_range = (100, 167)
     global_xlabel = "Scattering Angle [deg]"
-    global_ylabel = "Normalized Intensity / Elements"
+    global_ylabel = "Normalized Element Intensity"
     
     iters = check_dependencies['iterations']
     selected_iters = iters if iters else []

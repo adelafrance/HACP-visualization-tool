@@ -166,7 +166,8 @@ def fit_signal_column(y_pixels, profile):
                 break
         
         # Integrate difference only within the intersection bounds
-        return np.sum(profile[left_idx:right_idx+1] - broad_curve[left_idx:right_idx+1])
+        area = np.sum(profile[left_idx:right_idx+1] - broad_curve[left_idx:right_idx+1])
+        return max(0.0, area)
     except:
         return None
 

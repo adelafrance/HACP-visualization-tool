@@ -445,30 +445,73 @@ if app_mode in ["Interactive Analysis", "Figure Builder"]:
                 else:
                     st.session_state.raw_load_error = err
 
-        # 4. Load Precomputed Data (Dynamic/Standard)
+        # 4. Load Precomputed Data (Initial/Fresh Load)
         if st.session_state.get('loaded_meas_path') != active_meas_path or (is_local_only and not st.session_state.iterations):
-             load_mode = "dynamic" if st.session_state.get('subtract_wall', False) else "standard"
-             pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
-             
-             if pre_data:
-                  valid_keys = set(str(i) for i in st.session_state.iterations)
-                  if not valid_keys: # Local only recovery
-                      st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in pre_data.keys()])
-                      filtered_pre = pre_data
-                  else:
-                      filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys}
-                  
-                  st.session_state.precomputed_data = filtered_pre
-                  st.session_state.precomputed_fmt = pre_fmt
-                  # Set type BEFORE widget
-                  st.session_state.analysis_type = pre_meta.get('analysis_type', st.session_state.get('analysis_type', 'Mueller Matrix'))
-                  
-                  if not st.session_state.selected_iter_option in (["Average All"] + st.session_state.iterations):
-                       if st.session_state.iterations:
-                           st.session_state.selected_iter_option = st.session_state.iterations[0]
-             else:
-                  st.session_state.precomputed_data = None
-             st.session_state.loaded_meas_path = active_meas_path
+            # Determine initial load mode based on current mode
+            if app_mode == 'Figure Builder':
+                use_wall_init = st.session_state.get('global_subtract_wall', True)
+            else:
+                use_wall_init = st.session_state.get('subtract_wall', False)
+            
+            load_mode = "dynamic" if use_wall_init else "standard"
+            pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
+            
+            # Fallback: If Dynamic was requested but not found, try Standard
+            if not pre_data and load_mode == "dynamic":
+                # st.warning("Dynamic (Wall Subtracted) data not found. Falling back to Standard.")
+                load_mode = "standard"
+                pre_data, pre_meta, pre_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=load_mode)
+            
+            if pre_data:
+                valid_keys = set(str(i) for i in st.session_state.iterations)
+                if not valid_keys: # Local only recovery
+                    st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in pre_data.keys()])
+                    filtered_pre = pre_data
+                else:
+                    filtered_pre = {k: v for k, v in pre_data.items() if k in valid_keys }
+                
+                st.session_state.precomputed_data = filtered_pre
+                st.session_state.precomputed_fmt = pre_fmt
+                st.session_state.precomputed_meta = pre_meta
+                st.session_state.loaded_mode = load_mode
+                st.session_state.loaded_meas_path = active_meas_path
+                
+                # Set type BEFORE widget
+                st.session_state.analysis_type = pre_meta.get('analysis_type', st.session_state.get('analysis_type', 'Mueller Matrix'))
+                
+                if not st.session_state.selected_iter_option in (["Average All"] + st.session_state.iterations):
+                    if st.session_state.iterations:
+                        st.session_state.selected_iter_option = st.session_state.iterations[0]
+            else:
+                # If both failed, then we truly have nothing
+                st.session_state.precomputed_data = None
+                st.session_state.loaded_mode = None
+
+        # 5. Smart Cache Reload (Toggle Detection)
+        if st.session_state.get('precomputed_data'):
+            if app_mode == "Figure Builder":
+                target_wall = st.session_state.get('global_subtract_wall', True)
+            elif app_mode == "Interactive Analysis":
+                target_wall = st.session_state.get('subtract_wall', False)
+            else:
+                target_wall = None
+            
+            if target_wall is not None:
+                target_mode = "dynamic" if target_wall else "standard"
+                current_mode = st.session_state.get('loaded_mode', 'unknown')
+                
+                if current_mode != target_mode:
+                    new_data, new_meta, new_fmt = app_utils.try_load_precomputed(active_meas_path, LOCAL_CACHE_ROOT, mode=target_mode)
+                    if new_data:
+                        st.session_state.precomputed_data = new_data
+                        st.session_state.precomputed_meta = new_meta
+                        st.session_state.precomputed_fmt = new_fmt
+                        st.session_state.loaded_mode = target_mode
+                        if not st.session_state.iterations:
+                            st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in new_data.keys()])
+                    else:
+                        st.warning(f"Note: Could not load '{target_mode}' data (Wall Subtraction {'On' if target_wall else 'Off'}). Keeping current data.")
+        st.session_state.loaded_meas_path = active_meas_path
 
 if app_mode == "Data Dashboard":
     st.sidebar.title("Configuration")
@@ -698,28 +741,7 @@ if 'iterations' in st.session_state and st.session_state.iterations:
         # Only show method selector if wall subtraction is on
         wall_method = "dynamic" # Static method is removed.
 
-    # --- Smart Reload Logic ---
-    # Check if loaded data matches the current 'subtract_wall' state
-    if st.session_state.get('precomputed_data'):
-        # We can infer the type from the filename if we stored it, or check metadata if available
-        # For now, we'll try to reload if the user toggles the switch and we suspect a mismatch
-        # A simple heuristic: If subtract_wall is ON, we want dynamic file. If OFF, standard.
-        
-        target_mode = "dynamic" if subtract_wall else "standard"
-        current_mode = st.session_state.get('loaded_mode', 'unknown')
-        
-        if current_mode != target_mode:
-            new_data, new_meta, new_fmt = app_utils.try_load_precomputed(st.session_state.current_meas_path, LOCAL_CACHE_ROOT, mode=target_mode)
-            if new_data:
-                st.session_state.precomputed_data = new_data
-                st.session_state.loaded_mode = target_mode
-                
-                # RECOVER ITERATIONS: If we are in local-only mode or iterations were cleared, we must populate them from the new data
-                if not st.session_state.iterations:
-                    st.session_state.iterations = sorted([int(k) if str(k).isdigit() else k for k in new_data.keys()])
-                    # Reset selection to first available if needed
-                    if st.session_state.iterations and st.session_state.selected_iter_option not in (["Average All"] + st.session_state.iterations):
-                         st.session_state.selected_iter_option = st.session_state.iterations[0]
+    # (Smart Reload logic moved to top level for reliability across modes)
 
     # --- Calculation ---
     final_results, curves_to_show, roi_paths_to_show = {}, {}, {}
@@ -733,15 +755,49 @@ if 'iterations' in st.session_state and st.session_state.iterations:
     if st.session_state.get('use_precomputed') and st.session_state.get('precomputed_data'):
         pre = st.session_state.precomputed_data
         if is_avg:
-            all_res = defaultdict(list)
+            # -- Robust Ratio-of-Means Logic --
+            # Helper to average components
+            def get_component_mean_std(k_list):
+                 stack = [v for v in k_list if v is not None]
+                 if not stack: return None, None
+                 return np.nanmean(stack, axis=0), np.nanstd(stack, axis=0)
+
+            # 1. Collect all raw components
+            raw_components = defaultdict(list)
             for d in pre.values():
-                for k, v in d.items(): 
-                    # Keys might be stored as 'S33/S11' but processed expects 'S33_div_S11' or similar?
-                    # No, try_load_precomputed maps them back to '/'
-                    all_res[k].append(v)
-            if all_res:
-                for k, v in all_res.items(): 
-                    final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
+                for k, v in d.items():
+                    raw_components[k].append(v)
+            
+            # 2. Compute Means/Stds (Ratio-of-Means priority)
+            for k in raw_components.keys():
+                # Define derived logic
+                num_key, den_key = None, None
+                if k == "S12/S11": num_key, den_key = "S12", "S11"
+                elif k == "S33/S11": num_key, den_key = "S33", "S11"
+                elif k == "S34/S11": num_key, den_key = "S34", "S11"
+                elif k == "Depolarization Ratio": 
+                     num_key = 'Depol_Cross' if 'Depol_Cross' in raw_components else 'Cross'
+                     den_key = 'Depol_Parallel' if 'Depol_Parallel' in raw_components else 'Parallel'
+
+                if num_key and den_key and num_key in raw_components and den_key in raw_components:
+                    # Calculate Ratio of Means
+                    m_num, s_num = get_component_mean_std(raw_components[num_key])
+                    m_den, s_den = get_component_mean_std(raw_components[den_key])
+                    
+                    if m_num is not None and m_den is not None:
+                         with np.errstate(divide='ignore', invalid='ignore'):
+                             mean_val = m_num / m_den
+                             # Error prop for STD
+                             # std = |f| * sqrt( (sn/n)^2 + (sd/d)^2 )
+                             term1 = (s_num / m_num)**2
+                             term2 = (s_den / m_den)**2
+                             std_val = np.abs(mean_val) * np.sqrt(term1 + term2)
+                         final_results[k] = {'mean': mean_val, 'std': std_val}
+                else:
+                    # Fallback to standard Mean of Ratios (if components missing)
+                    # or standard variable
+                    m_val, s_val = get_component_mean_std(raw_components[k])
+                    final_results[k] = {'mean': m_val, 'std': s_val}
         else:
             iter_key = str(sel_iter) if str(sel_iter) in pre else sel_iter
             if iter_key in pre:
@@ -775,8 +831,34 @@ if 'iterations' in st.session_state and st.session_state.iterations:
                                     all_res['Depol_Cross'].append(curves['Depol_Cross'])
                         prog.progress((i+1)/len(st.session_state.iterations))
                 if all_res:
-                    for k, v in all_res.items(): 
-                        final_results[k] = {'mean': np.mean(v, axis=0), 'std': np.std(v, axis=0)}
+                    # Same robust logic for live calculation
+                    def get_comp_stats(k_list):
+                         stack = [v for v in k_list if v is not None]
+                         if not stack: return None, None
+                         return np.nanmean(stack, axis=0), np.nanstd(stack, axis=0)
+                         
+                    for k in all_res.keys():
+                        num_key, den_key = None, None
+                        if k == "S12/S11": num_key, den_key = "S12", "S11"
+                        elif k == "S33/S11": num_key, den_key = "S33", "S11"
+                        elif k == "S34/S11": num_key, den_key = "S34", "S11"
+                        elif k == "Depolarization Ratio": 
+                             num_key = 'Depol_Cross' if 'Depol_Cross' in all_res else 'Cross'
+                             den_key = 'Depol_Parallel' if 'Depol_Parallel' in all_res else 'Parallel'
+
+                        if num_key and den_key and num_key in all_res and den_key in all_res:
+                             m_num, s_num = get_comp_stats(all_res[num_key])
+                             m_den, s_den = get_comp_stats(all_res[den_key])
+                             if m_num is not None and m_den is not None:
+                                  with np.errstate(divide='ignore', invalid='ignore'):
+                                      mean_val = m_num / m_den
+                                      term1 = (s_num / m_num)**2
+                                      term2 = (s_den / m_den)**2
+                                      std_val = np.abs(mean_val) * np.sqrt(term1 + term2)
+                                  final_results[k] = {'mean': mean_val, 'std': std_val}
+                        else:
+                             m_val, s_val = get_comp_stats(all_res[k])
+                             final_results[k] = {'mean': m_val, 'std': s_val}
             else:
                 res_tuple = app_computation.calculate_curves_for_iteration(sel_iter, st.session_state.measurements, st.session_state.backgrounds, req_meas, analysis_type, bg_on, noise_sigma, 10**(-log_thresh), angle_model, subtract_wall)
                 if res_tuple:
@@ -830,7 +912,7 @@ if 'iterations' in st.session_state and st.session_state.iterations:
         x_angles = angle_model(np.arange(ref_w) + PIXEL_OFFSET_X)
         
         # Angle Selection (Synchronized Slider + Numeric Inputs)
-        if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 168.0)
+        if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 167.0)
         curr_low, curr_high = st.session_state.angle_range
         min_a, max_a = float(x_angles.min()), float(x_angles.max())
 

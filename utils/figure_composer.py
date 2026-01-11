@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 from plotly import subplots
 import matplotlib.pyplot as plt
 import io
+import pandas as pd # Added pandas import
+import warnings # Added warnings import
 from utils import plotting, app_computation, app_utils, polarimeter_processing
 import numpy as np
 from PIL import Image
@@ -17,7 +19,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                             common_labels=False, global_xlabel="", global_ylabel="", 
                             active_style=None, colors=None, primary_label="Primary", comp_label="Comparison",
                             show_legend=False, legend_loc="best", disable_sci_angle=False, disable_sci_y=False,
-                            angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False):
+                            angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False, subtract_wall=False):
     """
     Generates a matplotlib figure based on the provided specifications.
     Decoupled from Streamlit for use in optimization scripts.
@@ -57,33 +59,50 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
         
         if not actual_iters: return None, None, None
         
+        subtract_wall = st.session_state.get('global_subtract_wall', False)
+        
         for it in actual_iters:
             iter_res = None
             # Case 1: Primary data - check precomputed cache
             # We check if the PASSED measurements object matches the PRIMARY one
             is_primary = (t_meas is measurements)
             
-            if is_primary and check_dependencies.get('precomputed_data'):
-                    cached = check_dependencies['precomputed_data'].get(str(it))
+            p_data = check_dependencies.get('precomputed_data')
+            p_meta = check_dependencies.get('precomputed_meta', {})
+            is_cached_dynamic = p_meta.get('parameters', {}).get('subtract_wall', False)
+            
+            # Robust key check for measurements
+            it_in_meas = t_meas and (it in t_meas or str(it) in t_meas)
+            can_recompute = t_meas and it_in_meas
+
+            # Case 1: Use precomputed cache if it matches our subtract_wall setting
+            # OR if we are in Limited Mode and CANNOT recompute from raw files.
+            if is_primary and p_data:
+                if (is_cached_dynamic == subtract_wall) or not can_recompute:
+                    # Check both string and int keys for robustness
+                    cached = p_data.get(str(it))
+                    if cached is None: cached = p_data.get(int(it)) if str(it).isdigit() else None
                     if cached: iter_res = cached
             
             # Case 2: Comparison data
             if iter_res is None and not is_primary and check_dependencies.get('comp_precomputed_data'):
-                iter_res = check_dependencies['comp_precomputed_data'].get(str(it))
+                c_data = check_dependencies['comp_precomputed_data']
+                iter_res = c_data.get(str(it))
+                if iter_res is None: iter_res = c_data.get(int(it)) if str(it).isdigit() else None
 
             # Case 3: Raw data available - compute
-            if iter_res is None and t_meas and it in t_meas:
-                req = app_utils.get_required_measurements({it: t_meas[it]}, t_ana_type)
+            if iter_res is None and can_recompute:
+                # Ensure we have the correct files for the iteration (handle str/int)
+                it_meas_files = t_meas.get(it, t_meas.get(str(it)))
+                req = app_utils.get_required_measurements({it: it_meas_files}, t_ana_type)
                 try:
-                    # We might not have 'angle_model' here if it wasn't passed, handle gracefully?
-                    # It is passed as argument to parent function.
                     calc_res, _ = app_computation.calculate_curves_for_iteration(
-                        it, t_meas, t_bg, req, t_ana_type, 
-                        True, 3.0, 1e-4, angle_model
+                        it, {it: it_meas_files}, t_bg, req, t_ana_type, 
+                        True, 3.0, 1e-4, angle_model, subtract_wall=subtract_wall
                     )
                     if calc_res: iter_res = calc_res
                 except Exception as e:
-                    print(f"Error computing iteration {it}: {e}")
+                    st.error(f"Error computing iteration {it}: {e}")
             
             if not iter_res: continue
             
@@ -92,8 +111,41 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
             mm_elems = polarimeter_processing.calculate_mueller_elements(iter_res)
             
             # Support aliases for Depolarization Ratio calculation
-            if t_var in iter_res: y_val = iter_res[t_var]
+            
+            # --- New Ratio-of-Means Logic ---
+            # Identify if we need component-wise processing
+            ratio_components = None
+            if t_var == "S12/S11": ratio_components = ("S12", "S11")
+            elif t_var == "S33/S11": ratio_components = ("S33", "S11")
+            elif t_var == "S34/S11": ratio_components = ("S34", "S11")
+            elif t_var == "DoLP": ratio_components = ("DoLP_Num", "S11") # Special case requires |S12| check
+            
+            # Special DoLP handling if keys missing
+            if t_var == "DoLP" and "DoLP" in iter_res:
+                # Use pre-calculated DoLP if available (simple case)
+                y_val = iter_res["DoLP"]
+            elif ratio_components:
+                num_key, den_key = ratio_components
+                
+                # Handle DoLP Numerator on the fly if needed
+                if num_key == "DoLP_Num":
+                   num_val = np.abs(iter_res.get("S12")) if "S12" in iter_res else None
+                else:
+                   num_val = iter_res.get(num_key)
+                
+                den_val = iter_res.get(den_key)
+                
+                if num_val is not None and den_val is not None:
+                     # For Ratio-of-Means, we store the components tuple
+                     # We reuse t_curves to store tuples if ratio mode
+                     y_val = (num_val, den_val)
+                else:
+                     y_val = None
+            
+            # Standard single variable handling
+            elif t_var in iter_res: y_val = iter_res[t_var]
             elif t_var == "Depolarization Ratio":
+                # Depol Ratio is also a ratio-of-means candidate, but let's stick to existing logic for now unless requested
                 p_key = 'Depol_Parallel' if 'Depol_Parallel' in iter_res else 'Parallel'
                 c_key = 'Depol_Cross' if 'Depol_Cross' in iter_res else 'Cross'
                 if p_key in iter_res and c_key in iter_res:
@@ -103,18 +155,51 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
             if y_val is not None:
                 # Re-map X to Angle if model exists
                 if t_x is None:
+                    # Determine length based on y_val type
+                    val_len = len(y_val[0]) if isinstance(y_val, tuple) else len(y_val)
                     if angle_model:
-                        t_x = angle_model(np.arange(len(y_val)) + pixel_offset)
+                        t_x = angle_model(np.arange(val_len) + pixel_offset)
                     else:
-                        t_x = np.arange(len(y_val))
+                        t_x = np.arange(val_len)
                 t_curves.append(y_val)
         
         if not t_curves or t_x is None: return None, None, None
         
         # Stack and calculate mean/std
-        stack = np.vstack(t_curves) # (N_iter, N_pixels)
-        mean_curve = np.mean(stack, axis=0)
-        std_curve = np.std(stack, axis=0) if len(t_curves) > 1 else None
+        with warnings.catch_warnings(): # Use standard warnings
+            warnings.filterwarnings('ignore', category=RuntimeWarning)
+            
+            # Check if we have tuples (Ratio of Means mode)
+            if t_curves and isinstance(t_curves[0], tuple):
+                # Unpack
+                nums = np.vstack([x[0] for x in t_curves])
+                dens = np.vstack([x[1] for x in t_curves])
+                
+                mean_num = np.nanmean(nums, axis=0)
+                mean_den = np.nanmean(dens, axis=0)
+                
+                # Ratio of Means
+                with np.errstate(divide='ignore', invalid='ignore'):
+                     mean_curve = mean_num / mean_den
+                
+                # Error Propagation for STD
+                if len(t_curves) > 1:
+                    std_num = np.nanstd(nums, axis=0)
+                    std_den = np.nanstd(dens, axis=0)
+                    
+                    # std_f / |f| = sqrt( (std_A/A)^2 + (std_B/B)^2 )
+                    # std_f = |f| * ...
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                         term1 = (std_num / mean_num)**2
+                         term2 = (std_den / mean_den)**2
+                         std_curve = np.abs(mean_curve) * np.sqrt(term1 + term2)
+                else:
+                    std_curve = None
+            else:
+                # Standard Mean of Curves
+                stack = np.vstack(t_curves) # (N_iter, N_pixels)
+                mean_curve = np.nanmean(stack, axis=0)
+                std_curve = np.nanstd(stack, axis=0) if len(t_curves) > 1 else None
         
         # Filter by Angle Range
         if angle_range:
@@ -183,7 +268,23 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                 # Smart Scaling: Collect mean curves to determine Y-range
                 means_to_scale = []
                 s_factor = spec.get("scale_factor", 1.0)
-                int_label = spec.get("panel_title") # Use panel_title as internal label
+                
+                # --- Label Logic (Match Optimizer Defaults) ---
+                # 1. Internal Panel Label (Top Left) -> Always Variable Name
+                int_label = spec["variable"]
+
+                # 2. Smart Y-Axis Label
+                # Use custom "Panel Title/Y Label" if provided, otherwise smart default
+                custom_y = spec.get("panel_title")
+                if custom_y and custom_y.strip():
+                    panel_ylabel = custom_y 
+                elif not spec.get("ylabel") or spec.get("ylabel") == global_ylabel:
+                    if spec["variable"] == "S11" and s_factor < 0.01:
+                         panel_ylabel = "Intensity ($10^4$)"
+                    elif spec["variable"] == "Depolarization Ratio":
+                         panel_ylabel = "Depolarization Ratio"
+                    elif spec["variable"] != "S11": 
+                         panel_ylabel = "Normalized Element Intensity"
 
                 if y_p is not None: means_to_scale.append(y_p * s_factor)
 
@@ -240,7 +341,10 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                         pad = (mx - mn) * 0.15 
                         if pad == 0: pad = 0.1 * abs(mn) if mn != 0 else 1.0
                         panel_ylim = (mn - pad, mx + pad)
-
+                
+                # DEBUG: Trace why plot might be blank
+                # DEBUG: Trace why plot might be blank
+                
                 if y_p is not None:
                     plotting.create_mpl_line(
                         x_p, y_p, ax, y_err=std_p if spec['show_std'] else None,
@@ -276,9 +380,14 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                     ax.legend(loc=legend_loc)
                 
         except Exception as e:
-            print(f"Error in panel ({r},{c}): {e}")
+            st.error(f"Error in panel ({r},{c}): {e}")
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except np.linalg.LinAlgError:
+        pass # Ignore singular matrix error in layout engine
+    except Exception as e:
+        print(f"Warning: tight_layout failed: {e}")
     return fig
 
 def render_figure_composer(measurements, cache_root):
@@ -352,8 +461,8 @@ def render_figure_composer(measurements, cache_root):
                 try:
                     # Filter session state for relevant keys
                     keys_to_save = [k for k in st.session_state.keys() if 
-                                    k.startswith(('global_', 'pt_', 'ug_', 'it_', 'sit_', 'mk_', 'var_', 'std_', 'cp_', 'ms_', 'ymn_', 'ymx_', 'dk_', 'ci_', 'ov_', 'xl_', 'yl_')) or 
-                                    k in ['angle_range', 'fb_layout', 'angle_min_fb', 'angle_max_fb', 'angle_range_slider_fb', 'global_iters', 'global_select_all']]
+                                    k.startswith(('global_', 'pt_', 'ug_', 'it_', 'sit_', 'mk_', 'var_', 'std_', 'cp_', 'ms_', 'ymn_', 'ymx_', 'dk_', 'ci_', 'ov_', 'xl_', 'yl_', 'lbl_')) or 
+                                    k in ['angle_range', 'fb_layout', 'angle_min_fb', 'angle_max_fb', 'angle_range_slider_fb', 'global_iters', 'global_select_all', 'global_subtract_wall']]
                     config_data = {k: st.session_state[k] for k in keys_to_save}
                     
                     fpath = os.path.join(config_dir, f"{save_name}.json")
@@ -374,8 +483,9 @@ def render_figure_composer(measurements, cache_root):
                         with open(fpath, 'r') as f:
                             data = json.load(f)
                         st.session_state.update(data)
-                        st.session_state.angle_range = tuple(data.get('angle_range', (100.0, 168.0))) # Ensure tuple
-                        st.rerun()
+                        st.session_state.angle_range = tuple(data.get('angle_range', (100.0, 167.0))) # Ensure tuple
+                        st.success(f"Loaded: {load_name}")
+                        st.rerun() # Force immediate refresh of widgets (including dimensions)
                     except Exception as e:
                         st.error(f"Load failed: {e}")
             else:
@@ -387,14 +497,14 @@ def render_figure_composer(measurements, cache_root):
         # Dimensions
         unit = c1.selectbox("Unit", ["inch", "px"], index=0, key="global_unit")
         if unit == "inch":
-            w = c2.number_input("Width (in)", value=10.0, step=0.1, key="global_w_in")
-            h = c3.number_input("Height (in)", value=7.0, step=0.1, key="global_h_in")
+            w = c2.number_input("Width (in)", step=0.1, key="global_w_in")
+            h = c3.number_input("Height (in)", step=0.1, key="global_h_in")
         else:
-            w = c2.number_input("Width (px)", value=1000, step=100, key="global_w_px")
-            h = c3.number_input("Height (px)", value=700, step=100, key="global_h_px")
+            w = c2.number_input("Width (px)", step=100, key="global_w_px")
+            h = c3.number_input("Height (px)", step=100, key="global_h_px")
             
         # Angle Range
-        if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 168.0)
+        if 'angle_range' not in st.session_state: st.session_state.angle_range = (100.0, 167.0)
         
         # Callbacks for sync
         def _sync_from_slider_fb():
@@ -457,10 +567,12 @@ def render_figure_composer(measurements, cache_root):
         common_labels = c_l1.checkbox("Common Labels", help="Hide inner axis labels in grid layouts.", key="global_common_labels")
         show_std_global = c_l2.checkbox("Show Standard Deviation", help="Shade standard deviation if multiple iterations are averaged.", key="global_show_std")
         
-        global_xlabel = st.text_input("Global X Label", key="global_xlabel")
-        global_ylabel = st.text_input("Global Y Label", key="global_ylabel")
+        global_xlabel = st.text_input("Global X Label", value="Scattering Angle [deg]", key="global_xlabel")
+        global_ylabel = st.text_input("Global Y Label", value="Normalized Element Intensity", key="global_ylabel")
         
-        anchor_to_primary = st.checkbox("Anchor Y-Scaling to Primary Only", value=True, help="Determine Y-axis limits using only primary data, even when comparisons are added.", key="global_anchor")
+        c_l3, c_l4 = st.columns(2)
+        subtract_wall_global = c_l3.checkbox("Subtract Wall (Dynamic)", value=True, help="Enable advanced wall subtraction fitting. Requires raw measurement files.", key="global_subtract_wall")
+        anchor_to_primary = c_l4.checkbox("Anchor Y-Scaling to Primary Only", value=True, help="Determine Y-axis limits using only primary data, even when comparisons are added.", key="global_anchor")
 
         # Color Schemes
         COLOR_SCHEMES = {
@@ -639,6 +751,7 @@ def render_figure_composer(measurements, cache_root):
         'measurements': measurements,
         'backgrounds': st.session_state.backgrounds,
         'precomputed_data': st.session_state.get('precomputed_data'),
+        'precomputed_meta': st.session_state.get('precomputed_meta', {}),
         'active_dataset_type': st.session_state.get('analysis_type', 'Mueller Matrix'),
         'multi_comparisons': st.session_state.get('multi_comparisons', []),
         'iterations': global_iters
@@ -699,14 +812,23 @@ def render_figure_composer(measurements, cache_root):
                 if st.session_state.get('multi_comparisons'):
                      spec["show_comp"] = c_opt2.checkbox(f"Overlay Comp(s)", value=False, key=f"cp_{r}_{c}")
                 
-                # Manual Scaling
-                with st.expander("Manual Axis Scaling (Optional)"):
+                # Advanced Plot Options
+                with st.expander("Advanced Options (Scaling & Labels)"):
                     c_min, c_max = st.columns(2)
                     ymin = c_min.number_input("Y Min", value=0.0, step=0.1, key=f"ymn_{r}_{c}")
                     ymax = c_max.number_input("Y Max", value=1.0, step=0.1, key=f"ymx_{r}_{c}")
                     use_manual = st.checkbox("Enable Manual Scale", value=False, key=f"ms_{r}_{c}")
                     if use_manual:
                         spec["ylim"] = (ymin, ymax)
+                    
+                    c_sf, c_pl = st.columns(2)
+                    # Scale factor default 0.0001 if loaded from config or 1.0
+                    def_sf = st.session_state.get(f"sf_{r}_{c}", 1.0)
+                    spec["scale_factor"] = c_sf.number_input("Scale Factor", value=float(def_sf), format="%.1e", key=f"sf_{r}_{c}")
+                    
+                    # Panel Title / Custom Y-Label
+                    def_yl = st.session_state.get(f"yl_{r}_{c}", "")
+                    spec["panel_title"] = c_pl.text_input("Custom Panel/Y Label", value=def_yl, key=f"yl_{r}_{c}")
 
             elif p_type == "Signal Decomposition":
                  if len(iters_to_use) > 0:
@@ -768,7 +890,8 @@ def render_figure_composer(measurements, cache_root):
         angle_range=angle_range,
         angle_model=angle_model,
         pixel_offset=PIXEL_OFFSET_X,
-        anchor_to_primary=st.session_state.get('global_anchor', False)
+        anchor_to_primary=st.session_state.get('global_anchor', False),
+        subtract_wall=st.session_state.get('global_subtract_wall', False)
     )
     st.session_state.fig_preview = fig
 
@@ -824,7 +947,8 @@ def render_figure_composer(measurements, cache_root):
                                 active_style=active_style, colors=colors, primary_label=primary_label,
                                 show_legend=show_legend, legend_loc=legend_loc, disable_sci_angle=disable_sci_angle,
                                 angle_range=angle_range, angle_model=angle_model, pixel_offset=PIXEL_OFFSET_X,
-                                anchor_to_primary=st.session_state.get('global_anchor', False)
+                                anchor_to_primary=st.session_state.get('global_anchor', False),
+                                subtract_wall=st.session_state.get('global_subtract_wall', False)
                             )
                             base_path = os.path.join(out_dir, f"{out_fname}_base.{fmt}")
                             fig_base.savefig(base_path, format=fmt, dpi=dpi, bbox_inches='tight')
@@ -840,7 +964,8 @@ def render_figure_composer(measurements, cache_root):
                                 active_style=active_style, colors=colors, primary_label=primary_label,
                                 show_legend=show_legend, legend_loc=legend_loc, disable_sci_angle=disable_sci_angle,
                                 angle_range=angle_range, angle_model=angle_model, pixel_offset=PIXEL_OFFSET_X,
-                                anchor_to_primary=st.session_state.get('global_anchor', False)
+                                anchor_to_primary=st.session_state.get('global_anchor', False),
+                                subtract_wall=st.session_state.get('global_subtract_wall', False)
                             )
                             sym_path = os.path.join(out_dir, f"{out_fname}_symmetric.{fmt}")
                             fig_sym.savefig(sym_path, format=fmt, dpi=dpi, bbox_inches='tight')

@@ -106,19 +106,22 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
     if not show_y:
         ax.tick_params(axis='y', labelleft=False)
 
-    # Scientific Notation Logic
-    try:
-        if not disable_sci_x:
-            ax.ticklabel_format(style='sci', scilimits=(0,0), axis='x')
-        else:
-            ax.ticklabel_format(style='plain', axis='x')
-        
-        if not disable_sci_y:
-            ax.ticklabel_format(style='sci', scilimits=(0,0), axis='y')
-        else:
-            ax.ticklabel_format(style='plain', axis='y')
-    except (AttributeError, ValueError):
-        pass # Log scale or incompatible formatter
+        # Scientific Notation Logic
+        # User requested to DISABLE default offset behavior (e.g. 1e-1 at top)
+        # We obey the disable_sci flags for the '1eN' conversion, but we ALWAYS disable offset.
+        try:
+            if not disable_sci_x:
+                ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='x', useOffset=False)
+            else:
+                ax.ticklabel_format(style='plain', axis='x', useOffset=False)
+            
+            if not disable_sci_y:
+                # Even if scientific notation is allowed, we ensure it's not "just an offset"
+                ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='y', useOffset=False)
+            else:
+                ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+        except (AttributeError, ValueError):
+            pass # Log scale or incompatible formatter
         
     if ylim is not None:
         ax.set_ylim(ylim)
