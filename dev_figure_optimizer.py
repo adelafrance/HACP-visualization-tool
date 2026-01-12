@@ -50,6 +50,10 @@ PIXEL_OFFSET_X = 520
 # If this is None, the script will attempt to find a 'Parallel' image in the INPUT_DATA_PATH.
 LOCAL_RAW_IMAGE_OVERRIDE = "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/test_figure_optimizer/test_raw_img/20251209093319_Mono12_Iteration50_Step7_EP0_EW0_RP0_RW0.PNG"
 
+# --- SETTINGS ---
+ALIGN_TO_FULL_SENSOR = True # Set to True to match X-axis to full native image span (stable scaling)
+USE_LARGE_FONTS = True     # Set to True to use 18pt fonts (saves to separate '_large' folders)
+
 # --- PALETTE OPTIONS ---
 PALETTES = {
     "Tableau": {
@@ -224,7 +228,9 @@ def build_specs_depol():
             "iters": selected_iters, 
             "show_std": True, 
             "show_comp": False, 
-            "ylim": None
+            "ylim": None,
+            "y_major_ticks": "auto",
+            "y_minor_ticks": None
         }
     }
     return specs, layout_type, width, height, unit, global_xlabel, global_ylabel, angle_range
@@ -242,7 +248,7 @@ def build_specs_matrix():
     selected_iters = iters if iters else []
     
     specs = {
-        (1,1): {"type": "Computed Data", "variable": "S11", "iters": selected_iters, "show_std": True, "show_comp": False, "ylim": None, "panel_title": "S11", "scale_factor": 1e-4, "ylabel": r"Intensity ($10^4$)"},
+        (1,1): {"type": "Computed Data", "variable": "S11", "iters": selected_iters, "show_std": True, "show_comp": False, "ylim": None, "panel_title": "S11", "scale_factor": 1e-4, "ylabel": r"Intensity ($10^4$)", "legend_loc": "upper right"},
         (1,2): {"type": "Computed Data", "variable": "S12/S11", "iters": selected_iters, "show_std": True, "show_comp": False, "ylim": (-1, 1), "panel_title": "S12/S11"},
         (2,1): {"type": "Computed Data", "variable": "S33/S11", "iters": selected_iters, "show_std": True, "show_comp": False, "ylim": (-1, 1), "panel_title": "S33/S11"},
         (2,2): {"type": "Computed Data", "variable": "S34/S11", "iters": selected_iters, "show_std": True, "show_comp": False, "ylim": (-1, 1), "panel_title": "S34/S11"}
@@ -297,6 +303,22 @@ def run_optimization_case(case_name):
         
     angle_model = app_utils.load_angle_model_from_npz(app_utils.CALIBRATION_FILE_PATH)
 
+    # --- FULL-SENSOR ALIGNMENT CALCULATION ---
+    full_sensor_span = None
+    if ALIGN_TO_FULL_SENSOR:
+        try:
+            # Discover first image to get width
+            ref_img_path = discover_first_raw_image(DATA_PATH_BASE)
+            if ref_img_path and os.path.exists(ref_img_path):
+                with Image.open(ref_img_path) as im:
+                    ref_w = im.width
+                # Frame angles based on image width at its recorded offset
+                ref_angles = angle_model(np.arange(ref_w) + PIXEL_OFFSET_X)
+                full_sensor_span = (ref_angles[0], ref_angles[-1])
+                print(f"Calculated Full-Sensor Alignment Span: {full_sensor_span[0]:.2f} to {full_sensor_span[1]:.2f} deg")
+        except Exception as e:
+            print(f"Warning: Could not calculate full-sensor span: {e}")
+
     # --- STAGE 1: BASE FIGURE (Anchored Scaling) ---
     print(f"Generating BASE Figure ({TEST_CASE}) to anchor scaling...")
     
@@ -311,12 +333,17 @@ def run_optimization_case(case_name):
     
     check_dependencies['precomputed_data'], check_dependencies['precomputed_meta'] = (dyn_p, dyn_m) if dyn_p else (std_p, std_m)
     
+    # Determine Active Style
+    current_style_entry = "Optimizer_Large" if USE_LARGE_FONTS else "Default"
+    active_style = figure_composer.plotting.STYLES[current_style_entry]
+    print(f"Using Figure Style: {current_style_entry} (Font: {active_style.font_size}pt)")
+
     fig_base, report_base = figure_composer.generate_composite_figure(
         specs, layout_type, w, h, unit, 
         check_dependencies=check_dependencies,
         common_labels=True,
         global_xlabel=gx, global_ylabel=gy,
-        active_style=figure_composer.plotting.STYLES['Default'],
+        active_style=active_style,
         colors=[ACTIVE_PALETTE["primary"]],
         angle_range=ar,
         angle_model=angle_model,
@@ -324,7 +351,9 @@ def run_optimization_case(case_name):
         show_legend=True,
         disable_sci_angle=True,
         disable_sci_y=True,
-        y_precision=3
+        y_precision=3,
+        full_sensor_alignment=ALIGN_TO_FULL_SENSOR,
+        full_sensor_x_range=full_sensor_span
     )
     
     # --- STAGE 2: SYMMETRIC COMPARISON FIGURE ---
@@ -351,7 +380,7 @@ def run_optimization_case(case_name):
         check_dependencies=check_dependencies,
         common_labels=True,
         global_xlabel=gx, global_ylabel=gy,
-        active_style=figure_composer.plotting.STYLES['Default'],
+        active_style=active_style,
         colors=["#1f77b4"], # Primary blue
         angle_range=ar,
         angle_model=angle_model,
@@ -360,7 +389,9 @@ def run_optimization_case(case_name):
         disable_sci_angle=True,
         disable_sci_y=True,
         subtract_wall=True,
-        y_precision=3
+        y_precision=3,
+        full_sensor_alignment=ALIGN_TO_FULL_SENSOR,
+        full_sensor_x_range=full_sensor_span
     )
     
     # --- STAGE 3: NO-WALL BASELINE (DEPOL ONLY) ---
@@ -382,7 +413,7 @@ def run_optimization_case(case_name):
             check_dependencies=check_dependencies,
             common_labels=True,
             global_xlabel=gx, global_ylabel=gy,
-            active_style=figure_composer.plotting.STYLES['Default'],
+            active_style=active_style,
             colors=[ACTIVE_PALETTE["primary"]],
             angle_range=ar,
             angle_model=angle_model,
@@ -391,107 +422,149 @@ def run_optimization_case(case_name):
             disable_sci_angle=True,
             disable_sci_y=True,
             subtract_wall=False, # THE INTENT
-            y_precision=3
+            y_precision=3,
+            full_sensor_alignment=ALIGN_TO_FULL_SENSOR,
+            full_sensor_x_range=full_sensor_span
         )
 
     # --- OUTPUT ORGANIZATION ---
+    dir_suffix = "_large" if USE_LARGE_FONTS else ""
     SUBDIRS = {
-        "matrix": os.path.join(OUTPUT_DIR, "optimized_matrix"),
-        "depol": os.path.join(OUTPUT_DIR, "optimized_depol"),
-        "raw": os.path.join(OUTPUT_DIR, "optimized_raw_img"),
-        "fitting": os.path.join(OUTPUT_DIR, "optimized_signal_fitting"),
-        "reports": os.path.join(OUTPUT_DIR, "optimized_matrix" if TEST_CASE == "MATRIX" else "optimized_depol", "reports")
+        "matrix": os.path.join(OUTPUT_DIR, f"optimized_matrix{dir_suffix}"),
+        "depol": os.path.join(OUTPUT_DIR, f"optimized_depol{dir_suffix}"),
+        "raw": os.path.join(OUTPUT_DIR, f"optimized_raw_img{dir_suffix}"),
+        "fitting": os.path.join(OUTPUT_DIR, f"optimized_signal_fitting{dir_suffix}"),
+        "reports": os.path.join(OUTPUT_DIR, f"optimized_matrix{dir_suffix}" if TEST_CASE == "MATRIX" else f"optimized_depol{dir_suffix}", "reports")
     }
     for p in SUBDIRS.values():
         if not os.path.exists(p): os.makedirs(p)
  
-    # --- STAGE 4: METHODOLOGY FIGURES (Multi-Iteration Refinement) ---
+    # --- STAGE 4: METHODOLOGY FIGURES (Multi-Angle Swipe for Iteration 100) ---
     raw_images = [
-        ("Iteration 1", "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/test_figure_optimizer/test_raw_img/20251209092800_Mono12_Iteration1_Step7_EP0_EW0_RP0_RW0.PNG"),
-        ("Iteration 50", "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/test_figure_optimizer/test_raw_img/20251209093319_Mono12_Iteration50_Step7_EP0_EW0_RP0_RW0.PNG"),
         ("Iteration 100", "/Users/andrew/Documents/Uni_Wuppertal/RESEARCH/HACP/analysis/output/IPT_WIND_TUNNEL/test_figure_optimizer/test_raw_img/20251209093815_Mono12_Iteration100_Step7_EP0_EW0_RP0_RW0.PNG")
     ]
     
-    # Calculate column for 140 degrees once if possible
-    # We'll use a dummy load to get image dimensions if needed, or assume standard W
-    target_angle = 140.0
+    target_angles = [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 165.0]
     
-    for label, img_path in raw_images:
+    for iter_label, img_path in raw_images:
         if not os.path.exists(img_path):
-            print(f"Skipping methodology for {label} (File not found)")
+            print(f"Skipping methodology for {iter_label} (File not found)")
             continue
             
-        print(f"Processing methodology for {label}...")
+        print(f"Processing methodology for {iter_label}...")
         
         # Load image to get width for angle calculation
         img = np.array(Image.open(img_path))
         h_px, w_px = img.shape
         all_angles = angle_model(np.arange(w_px) + PIXEL_OFFSET_X)
-        
-        # Target column near 140 degrees
-        col_idx = np.argmin(np.abs(all_angles - target_angle))
-        actual_angle = all_angles[col_idx]
-        print(f"  Target: {target_angle} deg -> Column: {col_idx} (Actual: {actual_angle:.2f} deg)")
-        
-        # 4a. RAW HEATMAP (Angle-based, Plasma, Plain)
-        specs_raw = {
+        it_num = iter_label.split()[-1]
+
+        # 4a. MASTER HEATMAP (For reference in raw folder)
+        specs_raw_master = {
             (1,1): {
                 "type": "Raw Image",
                 "file": img_path,
                 "cmap": "plasma",
                 "zero_mode": "White",
-                "zero_threshold": 0.11, # Gradient threshold (11%)
-                "panel_title": "", # Empty string to suppress title
+                "zero_threshold": 0.11,
+                "panel_title": "", # REMOVED TITLE
                 "extent": [all_angles[0], all_angles[-1], h_px, 0],
-                "disable_sci_x": True, "disable_sci_y": True
+                "disable_sci_x": True, "disable_sci_y": True,
+                "y_major_ticks": 200
             }
         }
-        fig_raw, _ = figure_composer.generate_composite_figure(
-            specs_raw, "Single Panel", w, h, unit,
+        fig_master, _ = figure_composer.generate_composite_figure(
+            specs_raw_master, "Single Panel", w, h, unit,
             check_dependencies={},
-            active_style=figure_composer.plotting.STYLES['Default'],
+            active_style=active_style,
             global_xlabel="Scattering Angle [deg]",
             global_ylabel="Y Pixel"
         )
-        
-        # 4b. FITTING PROFILE (Expanded Series: Raw -> Components -> Total)
-        fitting_steps = [
-            ("raw", ["raw"], "Raw Data"),
-            ("wall_only", ["raw", "wall"], "Wall Fit"),
-            ("components", ["raw", "wall", "signal"], "Signal Separation"),
-            ("total", ["raw", "wall", "signal", "total"], "Full Fit")
-        ]
-        
-        it_num = label.split()[-1]
-        
-        # Save Heatmap
         raw_out = os.path.join(SUBDIRS["raw"], f"optimized_figure_methodology_raw_iter{it_num}.png")
-        fig_raw.savefig(raw_out, bbox_inches='tight', dpi=300)
-        print(f"  Saved Heatmap: {os.path.basename(raw_out)}")
+        fig_master.savefig(raw_out, bbox_inches='tight', dpi=300)
+        plt.close(fig_master)
 
-        for step_id, comps, step_title in fitting_steps:
-             specs_decomp = {
+        # 4b. PER-ANGLE OUTPUTS
+        for t_angle in target_angles:
+            col_idx = np.argmin(np.abs(all_angles - t_angle))
+            actual_angle = all_angles[col_idx]
+            print(f"  Target: {t_angle} deg (Actual: {actual_angle:.2f} deg)")
+            
+            # --- ANCHOR X-AXIS (Intensity) SCALING: PER ANGLE ---
+            profile = img[:, col_idx].astype(float)
+            max_p = np.max(profile)
+            intensity_xlim = [0, max_p * 1.1]
+            print(f"    Intensity Anchor (Angle {int(t_angle)}): {intensity_xlim[1]:.0f}")
+
+            # Create angle-specific subfolder
+            angle_dir = os.path.join(SUBDIRS["fitting"], f"angle_{int(t_angle)}")
+            if not os.path.exists(angle_dir): os.makedirs(angle_dir)
+
+            # 4b.i HEATMAP WITH SLICE INDICATOR
+            specs_raw_slice = {
                 (1,1): {
-                    "type": "Signal Decomposition",
+                    "type": "Raw Image",
                     "file": img_path,
-                    "col_idx": col_idx,
-                    "panel_title": f"Fit: {label} @ {actual_angle:.1f}°",
-                    "internal_label_loc": "top right",
-                    "show_legend": True,
-                    "components": comps
+                    "cmap": "plasma",
+                    "zero_mode": "White",
+                    "zero_threshold": 0.11,
+                    "panel_title": "", # REMOVED TITLE
+                    "extent": [all_angles[0], all_angles[-1], h_px, 0],
+                    "disable_sci_x": True, "disable_sci_y": True,
+                    "vline": actual_angle, # DASHED LINE AT ANGLE
+                    "vline_label": f"{actual_angle:.1f}°", # ADDED LABEL
+                    "y_major_ticks": 200
                 }
-             }
-             fig_decomp, _ = figure_composer.generate_composite_figure(
-                specs_decomp, "Single Panel", w, h, unit,
+            }
+            fig_slice, _ = figure_composer.generate_composite_figure(
+                specs_raw_slice, "Single Panel", w, h, unit,
                 check_dependencies={},
-                active_style=figure_composer.plotting.STYLES['Default'],
-                global_xlabel="Intensity",
+                active_style=active_style,
+                global_xlabel="Scattering Angle [deg]",
                 global_ylabel="Vertical Pixel"
-             )
-             
-             f_out = os.path.join(SUBDIRS["fitting"], f"optimized_figure_methodology_fitting_iter{it_num}_{step_id}.png")
-             fig_decomp.savefig(f_out, bbox_inches='tight', dpi=300)
-             print(f"    Saved Fit ({step_id}): {os.path.basename(f_out)}")
+            )
+            slice_out = os.path.join(angle_dir, f"methodology_heatmap_slice_{int(t_angle)}.png")
+            fig_slice.savefig(slice_out, bbox_inches='tight', dpi=300)
+            plt.close(fig_slice)
+
+            # 4b.ii FITTING PROFILES
+            # Tweaked "total" step as requested: Raw Data + Total Fit (Shaded Limegreen)
+            fitting_steps = [
+                ("raw", ["raw"], "Raw Data", "magenta", "limegreen"),
+                ("wall_only", ["raw", "wall"], "Wall Fit", "magenta", "limegreen"),
+                ("components", ["raw", "wall", "signal"], "Signal Separation", "magenta", "limegreen"),
+                ("total", ["raw", "total"], "Total Fit (Signal + Wall)", "gray", "limegreen") # Shaded Total (Limegreen)
+            ]
+            
+            for step_id, comps, step_title, s_color, t_color in fitting_steps:
+                 specs_decomp = {
+                    (1,1): {
+                        "type": "Signal Decomposition",
+                        "file": img_path,
+                        "col_idx": col_idx,
+                        "panel_title": f"Fit: {step_title} @ {actual_angle:.1f}°",
+                        "internal_label_loc": "top right",
+                        "show_legend": True,
+                        "components": comps,
+                        "signal_color": s_color,
+                        "total_color": t_color,
+                        "xlim": intensity_xlim, # ANCHORED SCALING (NOW PER ANGLE)
+                        "ylim": (h_px, 0), # SYNC Y-AXIS WITH HEATMAP
+                        "y_major_ticks": 200
+                    }
+                 }
+                 fig_decomp, _ = figure_composer.generate_composite_figure(
+                    specs_decomp, "Single Panel", w, h, unit,
+                    check_dependencies={},
+                    active_style=active_style,
+                    global_xlabel="Intensity",
+                    global_ylabel="Vertical Pixel"
+                 )
+                 
+                 f_out = os.path.join(angle_dir, f"methodology_fitting_iter{it_num}_{step_id}.png")
+                 fig_decomp.savefig(f_out, bbox_inches='tight', dpi=300)
+                 plt.close(fig_decomp)
+                 print(f"    Saved Fit ({step_id})")
 
     # STAGE 5: SAVE STANDARD FIGURES TO NEW FOLDERS
     # STAGE 5: SAVE STANDARD FIGURES TO NEW FOLDERS

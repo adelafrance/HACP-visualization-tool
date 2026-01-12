@@ -20,7 +20,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                             active_style=None, colors=None, primary_label="Primary", comp_label="Comparison",
                             show_legend=False, legend_loc="best", disable_sci_angle=False, disable_sci_y=False,
                             angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False, subtract_wall=False,
-                            y_precision=None):
+                            y_precision=None, full_sensor_alignment=False, full_sensor_x_range=None):
     """
     Generates a matplotlib figure based on the provided specifications.
     Decoupled from Streamlit for use in optimization scripts.
@@ -39,6 +39,9 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
     
     use_precomputed = st.session_state.get('use_precomputed', True)
     
+    # Calculate Full Sensor X-Range for alignment if requested (Passed explicitly for safety)
+    effective_xlim = full_sensor_x_range
+
     # Dimensions
     if unit == "px":
             final_w, final_h = width / 100.0, height / 100.0 # Convert px to inches for matplotlib
@@ -286,32 +289,50 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
 
                 plotting.create_mpl_heatmap(
                     img, ax, cmap=mpl_cmap, 
-                    title=final_title, 
+                    zmin=spec.get('zmin'), zmax=spec.get('zmax'), 
+                    title=final_title,
                     xlabel=panel_xlabel, ylabel=panel_ylabel,
                     show_x=show_x, show_y=show_y,
                     style=active_style,
                     extent=spec.get("extent"),
                     disable_sci_x=spec.get("disable_sci_x", False),
-                    disable_sci_y=spec.get("disable_sci_y", False)
+                    disable_sci_y=spec.get("disable_sci_y", False),
+                    vline=spec.get("vline"),
+                    vline_label=spec.get("vline_label"),
+                    y_major_ticks=spec.get("y_major_ticks"),
+                    y_minor_ticks=spec.get("y_minor_ticks")
                 )
 
             elif spec["type"] == "Signal Decomposition":
                     img = np.array(Image.open(spec["file"])).astype(float)
                     col_idx = int(spec['col_idx'])
                     if col_idx < 0 or col_idx >= img.shape[1]: continue
-                    norm_profile = img[:, col_idx]
-                    y_pixels = np.arange(len(norm_profile))
-                    popt = polarimeter_processing.fit_double_gaussian_params(y_pixels, norm_profile)
+                    profile = img[:, col_idx]
+                    y_px = np.arange(len(profile))
+                    popt = polarimeter_processing.fit_double_gaussian_params(y_px, profile)
                     
+                    # Auto-Tick Calculation
+                    y_maj = spec.get("y_major_ticks")
+                    y_min = spec.get("y_minor_ticks")
+                    if y_maj == "auto" and spec.get("ylim") is not None:
+                         y_maj, y_min = plotting.suggest_ticks(spec["ylim"][0], spec["ylim"][1])
+
                     plotting.create_mpl_decomposition(
-                        y_pixels, norm_profile, ax, popt=popt,
+                        y_px, profile, ax, popt=popt, 
+                        title=spec.get('panel_title_outer', ""), # Optional outer title
+                        style=active_style,
                         xlabel=panel_xlabel, ylabel=panel_ylabel,
                         show_x=show_x, show_y=show_y,
-                        style=active_style,
-                        internal_label=spec.get("panel_title", "Fitting Profile"),
-                        internal_label_loc=spec.get("internal_label_loc", "top left"),
-                        show_legend=spec.get("show_legend", True),
-                        components=spec.get("components")
+                        internal_label=spec.get('internal_label', spec.get('panel_title', 'Fitting Profile')),
+                        internal_label_loc=spec.get('internal_label_loc', 'top left'),
+                        show_legend=spec.get('show_legend', False),
+                        components=spec.get('components'),
+                        signal_color=spec.get('signal_color', 'magenta'),
+                        total_color=spec.get('total_color', 'orange'),
+                        xlim=spec.get('xlim'),
+                        ylim=spec.get('ylim'),
+                        y_major_ticks=y_maj,
+                        y_minor_ticks=y_min
                     )
 
             elif spec["type"] == "Computed Data":
@@ -414,6 +435,14 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                 # DEBUG: Trace why plot might be blank
                 # DEBUG: Trace why plot might be blank
                 
+                # DEBUG: Trace why plot might be blank
+                
+                # Auto-Tick Calculation
+                y_maj = spec.get("y_major_ticks")
+                y_min = spec.get("y_minor_ticks")
+                if y_maj == "auto" and panel_ylim is not None:
+                     y_maj, y_min = plotting.suggest_ticks(panel_ylim[0], panel_ylim[1])
+                
                 if y_p is not None:
                     plotting.create_mpl_line(
                         x_angles, y_p, ax, y_err=std_p if spec['show_std'] else None,
@@ -423,12 +452,15 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                         style=active_style, color=colors[0],
                         disable_sci_x=disable_sci_angle,
                         disable_sci_y=disable_sci_y,
+                        xlim=spec.get("xlim", effective_xlim),
                         ylim=panel_ylim,
                         scale_factor=s_factor,
                         internal_label=internal_label,
                         internal_label_loc=spec.get("internal_label_loc", "top left"),
                         y_precision=spec.get("y_precision", y_precision),
-                        show_legend=False # Delegated to end of panel
+                        show_legend=False, # Delegated to end of panel
+                        y_major_ticks=y_maj,
+                        y_minor_ticks=y_min
                     )
                 
                 # Plot all collected comparisons
@@ -443,12 +475,14 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                         style=active_style,
                         scale_factor=s_factor,
                         is_comparison=True,
+                        xlim=spec.get("xlim", effective_xlim),
                         show_legend=False # Delegated to end of panel
                     )
 
                 # Explicit Legend Handling (Accumulate all traces)
                 if spec.get("show_legend", False) and (y_p is not None or comparison_runs):
-                    ax.legend(fontsize=active_style.font_size*0.8, loc='best')
+                    l_loc = spec.get("legend_loc", "best")
+                    ax.legend(fontsize=active_style.legend_size, loc=l_loc)
                 
         except Exception as e:
             st.error(f"Error in panel ({r},{c}): {e}")

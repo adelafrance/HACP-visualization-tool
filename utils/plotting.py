@@ -13,19 +13,24 @@ class FigureStyle:
                  background_color="white",
                  grid_color="lightgrey",
                  show_grid=True,
-                 ticks_in=True):
+                 ticks_in=True,
+                 legend_size=None,
+                 tick_size=None):
         self.font_family = font_family
         self.font_size = font_size
         self.background_color = background_color
         self.grid_color = grid_color
         self.show_grid = show_grid
         self.ticks_in = ticks_in
+        self.legend_size = legend_size if legend_size is not None else max(8, self.font_size - 2)
+        self.tick_size = tick_size if tick_size is not None else max(8, self.font_size - 2)
         
     def apply_to_mpl(self, ax):
         """Applies style to a Matplotlib Axes object."""
         ax.set_facecolor(self.background_color)
         if self.show_grid:
-            ax.grid(True, color=self.grid_color, linestyle='--', linewidth=0.5)
+            ax.grid(True, which='major', color=self.grid_color, linestyle='--', linewidth=0.5)
+            ax.grid(True, which='minor', color=self.grid_color, linestyle=':', linewidth=0.3)
         else:
             ax.grid(False)
         
@@ -40,14 +45,15 @@ class FigureStyle:
         ax.set_title(ax.get_title(), **item, fontweight='bold')
         
         for label in (ax.get_xticklabels() + ax.get_yticklabels()):
-            label.set_fontsize(self.font_size - 2)
+            label.set_fontsize(self.tick_size)
             label.set_fontname(self.font_family)
 
 STYLES = {
     "Default": FigureStyle(),
     "Journal": FigureStyle(font_family="Times New Roman", font_size=14, background_color="white", grid_color="black"),
     "Publication": FigureStyle(font_family="Arial", font_size=14, background_color="white", grid_color="lightgrey"),
-    "Presentation": FigureStyle(font_family="Arial", font_size=18, background_color="white", grid_color="dimgrey")  
+    "Presentation": FigureStyle(font_family="Arial", font_size=18, background_color="white", grid_color="dimgrey"),
+    "Optimizer_Large": FigureStyle(font_family="Arial", font_size=18, background_color="white", grid_color="lightgrey", legend_size=10)
 }
 
 def get_mpl_modified_cmap(base_name="viridis", zero_mode="Default", zero_threshold=None):
@@ -73,7 +79,7 @@ def get_mpl_modified_cmap(base_name="viridis", zero_mode="Default", zero_thresho
         return ListedColormap(colors)
     return base_cmap
 
-def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, extent=None, disable_sci_x=False, disable_sci_y=False):
+def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, extent=None, disable_sci_x=False, disable_sci_y=False, vline=None, vline_label=None, y_major_ticks=None, y_minor_ticks=None):
     """Matplotlib Heatmap on a specific Axes."""
     if style is None: style = STYLES["Default"]
     
@@ -81,10 +87,28 @@ def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", 
     # For now, we assume cmap could be a Colormap object already
     im = ax.imshow(img, cmap=cmap, vmin=zmin, vmax=zmax, aspect='auto', extent=extent)
     
+    if vline is not None:
+        ax.axvline(x=vline, color='red', linestyle='--', linewidth=1.5, alpha=0.9)
+        if vline_label:
+            # Place label slightly to the right of the line, near the top
+            ax.text(vline + (extent[1]-extent[0])*0.01 if extent else vline + 1, 
+                    extent[3] + (extent[2]-extent[3])*0.1 if extent else 10, 
+                    vline_label, color='red', fontweight='bold', 
+                    fontsize=style.font_size, 
+                    bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=1))
+
     if title: ax.set_title(title)
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
+    # Tick Spacing Control
+    if y_major_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_major_locator(MultipleLocator(y_major_ticks))
+    if y_minor_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor_ticks))
+
     style.apply_to_mpl(ax)
     
     # Enforce tick visibility and labeling
@@ -106,7 +130,7 @@ def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", 
         pass
     return im
 
-def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, disable_sci_y=False, linestyle="-", ylim=None, internal_label=None, internal_label_loc="top left", scale_factor=1.0, is_comparison=False, y_precision=None, show_legend=True):
+def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, disable_sci_y=False, linestyle="-", xlim=None, ylim=None, internal_label=None, internal_label_loc="top left", scale_factor=1.0, is_comparison=False, y_precision=None, show_legend=True, y_major_ticks=None, y_minor_ticks=None):
     """Matplotlib Line Plot on a specific Axes."""
     if style is None: style = STYLES["Default"]
     
@@ -140,6 +164,14 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
                 fontsize=style.font_size, family=style.font_family,
                 bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1))
 
+    # Tick Spacing Control
+    if y_major_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_major_locator(MultipleLocator(y_major_ticks))
+    if y_minor_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor_ticks))
+
     style.apply_to_mpl(ax)
 
     # Handle Axis Visibility vs Tick Visibility (Applied LAST to prevent style overrides)
@@ -168,12 +200,14 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
             ax.yaxis.set_major_formatter(FormatStrFormatter(f'%.{int(y_precision)}f'))
 
         if show_legend and label:
-             ax.legend(fontsize=style.font_size*0.8, loc='best')
+             ax.legend(fontsize=style.legend_size, loc='best')
 
+    if xlim is not None:
+        ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
 
-def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", style=None, xlabel="Intensity", ylabel="Pixel", show_x=True, show_y=True, internal_label=None, internal_label_loc="top left", show_legend=False, components=None):
+def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", style=None, xlabel="Intensity", ylabel="Pixel", show_x=True, show_y=True, internal_label=None, internal_label_loc="top left", show_legend=False, components=None, signal_color="magenta", total_color="orange", xlim=None, ylim=None, y_major_ticks=None, y_minor_ticks=None):
     """Matplotlib Decomposition Plot with selective component rendering."""
     if style is None: style = STYLES["Default"]
     from utils import polarimeter_processing
@@ -210,11 +244,12 @@ def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", st
             ax.fill_betweenx(y_pixels, broad_curve, 0, color='gray', alpha=0.2)
         
         if 'signal' in components:
-            ax.plot(narrow_curve, y_pixels, label='Signal', color='magenta')
-            ax.fill_betweenx(y_pixels, narrow_curve, 0, color='magenta', alpha=0.2)
+            ax.plot(narrow_curve, y_pixels, label='Signal', color=signal_color)
+            ax.fill_betweenx(y_pixels, narrow_curve, 0, color=signal_color, alpha=0.2)
         
         if 'total' in components:
-            ax.plot(total_curve, y_pixels, label='Total Fit', color='black', linestyle=':')
+            ax.plot(total_curve, y_pixels, label='Total Fit', color='black', linestyle=':', linewidth=1.5)
+            ax.fill_betweenx(y_pixels, total_curve, 0, color=total_color, alpha=0.2)
         
     ax.invert_yaxis() # Image Coordinates
     
@@ -222,16 +257,66 @@ def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", st
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
+    if xlim:
+        ax.set_xlim(xlim)
+    if ylim:
+        ax.set_ylim(ylim)
+
+    # Tick Spacing Control
+    if y_major_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_major_locator(MultipleLocator(y_major_ticks))
+    if y_minor_ticks is not None:
+        from matplotlib.ticker import MultipleLocator
+        ax.yaxis.set_minor_locator(MultipleLocator(y_minor_ticks))
+
     style.apply_to_mpl(ax)
     
     # Enforce tick visibility and labeling
+    ax.tick_params(axis='both', which='major', labelsize=style.tick_size)
     ax.tick_params(axis='x', labelbottom=show_x)
     ax.tick_params(axis='y', labelleft=show_y)
     
     if show_legend:
-        ax.legend(fontsize=style.font_size*0.8, loc='best')
+        # User requested fixed 'lower right' for methodology refinement
+        ax.legend(fontsize=style.legend_size, loc='lower right', framealpha=0.5)
 
     return ax
+
+
+def suggest_ticks(mn, mx, target_count=5):
+    """
+    Suggests clever major and minor tick intervals based on a data range.
+    Targets roughly target_count major intervals.
+    """
+    if mn is None or mx is None: return None, None
+    span = mx - mn
+    if span <= 0: return None, None
+    
+    # Calculate a raw interval
+    raw_interval = span / target_count
+    
+    # Standard "Pretty" intervals
+    # Since we are often dealing with small decimals (0.01, 0.05..), we scale to power of 10
+    magnitude = 10 ** np.floor(np.log10(raw_interval))
+    res = raw_interval / magnitude
+    
+    if res < 1.5: interval = 1.0 * magnitude
+    elif res < 2.5: interval = 2.0 * magnitude
+    elif res < 4.0: interval = 2.5 * magnitude # Or 3? User mentioned 3 as an option.
+    elif res < 7.5: interval = 5.0 * magnitude
+    else: interval = 10.0 * magnitude
+    
+    # Special overrides for the user's specific request
+    # If the range is ~0.15, interval 0.03 (5 steps) or 0.05 (3 steps)
+    # The math above would give 0.02 (7.5 steps) or 0.05
+    if 0.12 <= span <= 0.18 and interval == 0.02:
+        interval = 0.03 # Harmonize with user's specific "clever" example
+        
+    major = interval
+    minor = interval / 2.0 # Standard 2:1 ratio for the minor grid request
+    
+    return major, minor
 
 
 def get_mpl_modified_cmap(base_name="viridis", zero_mode="Default", zero_threshold=None):
