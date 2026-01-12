@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import io
 import pandas as pd # Added pandas import
 import warnings # Added warnings import
-from utils import plotting, app_computation, app_utils, polarimeter_processing
+from utils import plotting, app_computation, app_utils, polarimeter_processing, stats
 import numpy as np
 from PIL import Image
 
@@ -19,7 +19,8 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                             common_labels=False, global_xlabel="", global_ylabel="", 
                             active_style=None, colors=None, primary_label="Primary", comp_label="Comparison",
                             show_legend=False, legend_loc="best", disable_sci_angle=False, disable_sci_y=False,
-                            angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False, subtract_wall=False):
+                            angle_range=None, angle_model=None, pixel_offset=0, anchor_to_primary=False, subtract_wall=False,
+                            y_precision=None):
     """
     Generates a matplotlib figure based on the provided specifications.
     Decoupled from Streamlit for use in optimization scripts.
@@ -30,6 +31,13 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
     if check_dependencies is None: check_dependencies = {}
     measurements = check_dependencies.get('measurements')
     backgrounds = check_dependencies.get('backgrounds')
+    p_data = check_dependencies.get('precomputed_data')
+    p_meta = check_dependencies.get('precomputed_meta', {})
+    
+    # Robustly determine if the current p_data is wall-subtracted using metadata
+    is_cached_dynamic = p_meta.get('parameters', {}).get('subtract_wall', False)
+    
+    use_precomputed = st.session_state.get('use_precomputed', True)
     
     # Dimensions
     if unit == "px":
@@ -48,7 +56,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
     cols = 2 if "2x2" in layout_type or "2x1" in layout_type else 1
 
     # Define helper internally to close over dependencies
-    def get_series_data(t_iters, t_meas, t_bg, t_ana_type, t_var):
+    def get_series_data(t_iters, t_meas, t_bg, t_ana_type, t_var, t_pre=None):
         t_curves = []
         t_x = None
         
@@ -59,37 +67,27 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
         
         if not actual_iters: return None, None, None
         
-        subtract_wall = st.session_state.get('global_subtract_wall', False)
+        subtract_wall_local = subtract_wall if subtract_wall is not None else st.session_state.get('global_subtract_wall', False)
         
         for it in actual_iters:
             iter_res = None
-            # Case 1: Primary data - check precomputed cache
-            # We check if the PASSED measurements object matches the PRIMARY one
             is_primary = (t_meas is measurements)
             
-            p_data = check_dependencies.get('precomputed_data')
-            p_meta = check_dependencies.get('precomputed_meta', {})
-            is_cached_dynamic = p_meta.get('parameters', {}).get('subtract_wall', False)
+            # Use provided t_pre or fall back to primary p_data
+            active_p_data = t_pre if t_pre is not None else (p_data if is_primary else check_dependencies.get('comp_precomputed_data'))
             
             # Robust key check for measurements
             it_in_meas = t_meas and (it in t_meas or str(it) in t_meas)
             can_recompute = t_meas and it_in_meas
 
-            # Case 1: Use precomputed cache if it matches our subtract_wall setting
-            # OR if we are in Limited Mode and CANNOT recompute from raw files.
-            if is_primary and p_data:
-                if (is_cached_dynamic == subtract_wall) or not can_recompute:
+            # Use explicit precomputed data if provided, otherwise check dependencies
+            if active_p_data and use_precomputed:
+                if (is_cached_dynamic == subtract_wall_local) or not can_recompute:
                     # Check both string and int keys for robustness
-                    cached = p_data.get(str(it))
-                    if cached is None: cached = p_data.get(int(it)) if str(it).isdigit() else None
+                    cached = active_p_data.get(str(it))
+                    if cached is None: cached = active_p_data.get(int(it)) if str(it).isdigit() else None
                     if cached: iter_res = cached
             
-            # Case 2: Comparison data
-            if iter_res is None and not is_primary and check_dependencies.get('comp_precomputed_data'):
-                c_data = check_dependencies['comp_precomputed_data']
-                iter_res = c_data.get(str(it))
-                if iter_res is None: iter_res = c_data.get(int(it)) if str(it).isdigit() else None
-
             # Case 3: Raw data available - compute
             if iter_res is None and can_recompute:
                 # Ensure we have the correct files for the iteration (handle str/int)
@@ -98,7 +96,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                 try:
                     calc_res, _ = app_computation.calculate_curves_for_iteration(
                         it, {it: it_meas_files}, t_bg, req, t_ana_type, 
-                        True, 3.0, 1e-4, angle_model, subtract_wall=subtract_wall
+                        True, 3.0, 1e-4, angle_model, subtract_wall=subtract_wall_local
                     )
                     if calc_res: iter_res = calc_res
                 except Exception as e:
@@ -145,21 +143,54 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                      # We reuse t_curves to store tuples if ratio mode
                      y_val = (num_val, den_val)
                 else:
-                     # FALLBACK: If components are missing (e.g. old cache), use the pre-calculated value
-                     # This results in "Mean of Ratios" (rougher) but is better than a blank plot.
-                     if t_var == "Depolarization Ratio" and t_var in iter_res:
+                     # FALLBACK: If components are missing (e.g. old cache or S-Matrix), try alternatives
+                     if t_var in iter_res:
                          y_val = iter_res[t_var]
+                     elif t_var == "Depolarization Ratio":
+                         # Fallback: Calculate direct from S11 and S12 if available
+                         # Assuming Linear Horizontal Input
+                         # Parallel (Horizontal) = I_PH = 0.5 * (S11 + S12)
+                         # Perpendicular (Vertical) = I_PV = 0.5 * (S11 - S12)
+                         # Depol Ratio = Perp / Para = (S11 - S12) / (S11 + S12)
+                         
+                         s11 = iter_res.get("S11")
+                         s12 = iter_res.get("S12")
+                         
+                         if s11 is not None and s12 is not None:
+                             para = s11 + s12
+                             perp = s11 - s12
+                             # Guard against division by zero
+                             y_val = (perp) / (para + 1e-9)
+                         
+                         # Fallback to DoLP if S11/S12 missing (unlikely if DoLP present)
+                         elif "DoLP" in iter_res:
+                              dolp = iter_res["DoLP"]
+                              y_val = (1.0 - dolp) / (1.0 + dolp + 1e-9)
+                         else:
+                             y_val = None
                      else:
                          y_val = None
             
             # Standard single variable handling
             elif t_var in iter_res: y_val = iter_res[t_var]
             elif t_var == "Depolarization Ratio":
-                # Depol Ratio is also a ratio-of-means candidate, but let's stick to existing logic for now unless requested
+                # DEBUG: Trace keys for Depol
+                # print(f"DEBUG: Computing Depol for It {it}. Keys: {list(iter_res.keys())[:5]}...") 
+                
                 p_key = 'Depol_Parallel' if 'Depol_Parallel' in iter_res else 'Parallel'
                 c_key = 'Depol_Cross' if 'Depol_Cross' in iter_res else 'Cross'
                 if p_key in iter_res and c_key in iter_res:
                     y_val = (iter_res[c_key]+1e-9)/(iter_res[p_key]+1e-9)
+                elif all(k in iter_res for k in ["S11", "S12", "S21", "S22"]):
+                    # Fallback: Calculate from Mueller Matrix (Horizontal Input assumed)
+                    s11, s12, s21, s22 = iter_res["S11"], iter_res["S12"], iter_res["S21"], iter_res["S22"]
+                    para = s11 + s12 + s21 + s22
+                    perp = s11 + s12 - s21 - s22
+                    y_val = (perp + 1e-9) / (para + 1e-9)
+                    print(f"DEBUG: Depol Fallback Used. Val range: {np.min(y_val):.2e} to {np.max(y_val):.2e}")
+                else:
+                    print(f"DEBUG: Depol Failed. Missing keys. Have: {list(iter_res.keys())}")
+                    
             elif mm_elems and t_var in mm_elems: y_val = mm_elems[t_var]
             
             if y_val is not None:
@@ -218,6 +249,10 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
         else:
             return t_x, mean_curve, std_curve
 
+    report_data = [] # To store quantitative metrics
+    t_ana_type = check_dependencies.get('active_dataset_type', 'Mueller Matrix') if check_dependencies else "Mueller Matrix"
+    primary_label = check_dependencies.get('primary_label', 'Primary') if check_dependencies else "Primary"
+    
     for (r, c), spec in fig_specs.items():
         idx = (r-1)*cols + c
         ax = fig.add_subplot(rows, cols, idx)
@@ -240,12 +275,24 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                             x_pixel_min, x_pixel_max = valid_indices[0], valid_indices[-1]
                             img = img[:, x_pixel_min:x_pixel_max+1]
                 
+                # Support custom colormapping (matching Viewer's zero-masking)
+                c_name = spec.get("cmap", "viridis")
+                z_mode = spec.get("zero_mode", "Default")
+                z_threshold = spec.get("zero_threshold")
+                mpl_cmap = plotting.get_mpl_modified_cmap(c_name, z_mode, zero_threshold=z_threshold)
+                
+                panel_title_override = spec.get("panel_title")
+                final_title = panel_title_override if panel_title_override is not None else f"({r},{c})"
+
                 plotting.create_mpl_heatmap(
-                    img, ax, cmap='viridis', 
-                    title=f"({r},{c})", 
+                    img, ax, cmap=mpl_cmap, 
+                    title=final_title, 
                     xlabel=panel_xlabel, ylabel=panel_ylabel,
                     show_x=show_x, show_y=show_y,
-                    style=active_style
+                    style=active_style,
+                    extent=spec.get("extent"),
+                    disable_sci_x=spec.get("disable_sci_x", False),
+                    disable_sci_y=spec.get("disable_sci_y", False)
                 )
 
             elif spec["type"] == "Signal Decomposition":
@@ -257,10 +304,14 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                     popt = polarimeter_processing.fit_double_gaussian_params(y_pixels, norm_profile)
                     
                     plotting.create_mpl_decomposition(
-                    y_pixels, norm_profile, ax, popt=popt,
-                    xlabel=panel_xlabel, ylabel=panel_ylabel,
-                    show_x=show_x, show_y=show_y,
-                    style=active_style
+                        y_pixels, norm_profile, ax, popt=popt,
+                        xlabel=panel_xlabel, ylabel=panel_ylabel,
+                        show_x=show_x, show_y=show_y,
+                        style=active_style,
+                        internal_label=spec.get("panel_title", "Fitting Profile"),
+                        internal_label_loc=spec.get("internal_label_loc", "top left"),
+                        show_legend=spec.get("show_legend", True),
+                        components=spec.get("components")
                     )
 
             elif spec["type"] == "Computed Data":
@@ -284,9 +335,11 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                 int_label = spec["variable"]
 
                 # 2. Smart Y-Axis Label
-                # Use custom "Panel Title/Y Label" if provided, otherwise smart default
+                # Use explicit ylabel if provided, else fallback to panel title, else smart default
                 custom_y = spec.get("panel_title")
-                if custom_y and custom_y.strip():
+                if spec.get("ylabel"):
+                    panel_ylabel = spec["ylabel"]
+                elif custom_y and custom_y.strip():
                     panel_ylabel = custom_y 
                 elif not spec.get("ylabel") or spec.get("ylabel") == global_ylabel:
                     if spec["variable"] == "S11" and s_factor < 0.01:
@@ -296,45 +349,51 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                     elif spec["variable"] != "S11": 
                          panel_ylabel = "Normalized Element Intensity"
 
-                if y_p is not None: means_to_scale.append(y_p * s_factor)
-
-                # Comparison(s)
-                comparison_runs = [] # List of (x, y, std, label, color)
+                x_angles, y_p, std_p = get_series_data(None, measurements, backgrounds, t_ana_type, spec["variable"], t_pre=p_data)
                 
-                # Handling for legacy single comparison
-                if spec.get("show_comp") and check_dependencies.get('comp_measurements'):
-                     c_meas = check_dependencies['comp_measurements']
-                     c_bg = check_dependencies.get('comp_backgrounds', {})
-                     c_iters = check_dependencies.get('global_comp_iters', [])
-                     x_c, y_c, std_c = get_series_data(c_iters, c_meas, c_bg, ana_type, spec['variable'])
-                     if y_c is not None:
-                         comparison_runs.append((x_c, y_c, std_c, comp_label, colors[1] if len(colors)>1 else None))
-                         means_to_scale.append(y_c * s_factor)
+                # Retrieve S11 for weighting if this is a ratio or depolarizaton
+                s11_weight = None
+                if spec["variable"] != "S11" and y_p is not None:
+                    _, s11_weight, _ = get_series_data(None, measurements, backgrounds, t_ana_type, "S11", t_pre=p_data)
 
-                # Handling for new multi-comparison structure
-                if spec.get("show_comp") and check_dependencies.get('multi_comparisons'):
-                    multi_comp = check_dependencies['multi_comparisons']
-                    for i, comp_deps in enumerate(multi_comp):
-                        c_meas = comp_deps.get('measurements')
-                        c_bg = comp_deps.get('backgrounds', {})
-                        c_pre = comp_deps.get('precomputed_data', {})
-                        c_iters = comp_deps.get('iterations', [])
-                        
-                        # We need to temporarily add precomputed_data to check_dependencies for get_series_data to find it
-                        # This is a bit hacky but keeps the helper simple.
-                        orig_comp_pre = check_dependencies.get('comp_precomputed_data')
-                        check_dependencies['comp_precomputed_data'] = c_pre
-                        
-                        x_mc, y_mc, std_mc = get_series_data(c_iters, c_meas, c_bg, ana_type, spec['variable'])
-                        
-                        # Restore
-                        check_dependencies['comp_precomputed_data'] = orig_comp_pre
-                        
-                        if y_mc is not None:
-                            c_label = comp_deps.get('label', f"Comp {i+1}")
-                            c_color = comp_deps.get('color')
-                            comparison_runs.append((x_mc, y_mc, std_mc, c_label, c_color))
-                            means_to_scale.append(y_mc * s_factor)
+                internal_label = spec.get("panel_title", spec["variable"])
+                
+                # Comparisons
+                comparison_runs = []
+                if spec.get("show_comp", False) and check_dependencies:
+                    comp_list = check_dependencies.get('comparisons', check_dependencies.get('multi_comparisons', []))
+                    
+                    # Robust comparison palette: use user's secondary color first, then categorical defaults
+                    # (Primary is usually colors[0])
+                    comp_palette = ["#d62728", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+                    if colors and len(colors) > 1 and colors[1]:
+                        if colors[1] in comp_palette: comp_palette.remove(colors[1])
+                        comp_palette.insert(0, colors[1])
+
+                    for i, comp in enumerate(comp_list):
+                        # Use internal helper with comparison measurements/backgrounds AND their specific precomputed data
+                        _, y_c, std_c = get_series_data(None, comp.get('measurements'), comp.get('backgrounds'), t_ana_type, spec["variable"], t_pre=comp.get('precomputed_data'))
+                        if y_c is not None:
+                            c_label = comp.get('name', comp.get('label', f"Comp {i+1}"))
+                            comparison_runs.append({
+                                "y": y_c, "std": std_c, "name": c_label, 
+                                "color": comp_palette[i % len(comp_palette)]
+                            })
+                            
+                            # COMPUTE SYMMETRY METRICS
+                            is_log_type = (spec["variable"] == "S11")
+                            metrics = stats.compute_symmetry_metrics(y_p, y_c, weight_y=s11_weight, is_log=is_log_type)
+                            report_data.append({
+                                "Panel": f"({r},{c}) {internal_label}",
+                                "Variable": spec["variable"],
+                                "Comparison": c_label,
+                                "Bias": metrics['bias'],
+                                "Match (%)": metrics['match']
+                            })
+
+                if y_p is not None: means_to_scale.append(y_p * s_factor)
+                for comp_run in comparison_runs:
+                     means_to_scale.append(comp_run["y"] * s_factor)
 
                 # Calculate Y-range if not manual
                 panel_ylim = spec.get("ylim")
@@ -357,7 +416,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                 
                 if y_p is not None:
                     plotting.create_mpl_line(
-                        x_p, y_p, ax, y_err=std_p if spec['show_std'] else None,
+                        x_angles, y_p, ax, y_err=std_p if spec['show_std'] else None,
                         label=primary_label,
                         xlabel=panel_xlabel, ylabel=panel_ylabel,
                         show_x=show_x, show_y=show_y,
@@ -366,28 +425,30 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
                         disable_sci_y=disable_sci_y,
                         ylim=panel_ylim,
                         scale_factor=s_factor,
-                        internal_label=int_label
+                        internal_label=internal_label,
+                        internal_label_loc=spec.get("internal_label_loc", "top left"),
+                        y_precision=spec.get("y_precision", y_precision),
+                        show_legend=False # Delegated to end of panel
                     )
                 
                 # Plot all collected comparisons
-                for x_c, y_c, std_c, c_lab, c_col in comparison_runs:
+                for comp_run in comparison_runs:
                     plotting.create_mpl_line(
-                        x_c, y_c, ax, 
-                        y_err=std_c if spec.get('show_std_comp', False) else None, 
-                        label=c_lab,
-                        color=c_col if c_col else None,
-                        linestyle='--',
-                        xlabel=panel_xlabel, ylabel=panel_ylabel,
-                        show_x=show_x, show_y=show_y,
+                        x_angles, 
+                        comp_run["y"], ax, 
+                        y_err=comp_run["std"] if spec.get('show_std_comp', False) else None, 
+                        label=comp_run["name"],
+                        color=comp_run["color"],
+                        show_x=False, show_y=False, # Do not overwrite primary labels
                         style=active_style,
-                        disable_sci_x=disable_sci_angle,
-                        disable_sci_y=disable_sci_y,
-                        ylim=panel_ylim,
-                        scale_factor=s_factor
+                        scale_factor=s_factor,
+                        is_comparison=True,
+                        show_legend=False # Delegated to end of panel
                     )
 
-                if show_legend and (y_p is not None or comparison_runs):
-                    ax.legend(loc=legend_loc)
+                # Explicit Legend Handling (Accumulate all traces)
+                if spec.get("show_legend", False) and (y_p is not None or comparison_runs):
+                    ax.legend(fontsize=active_style.font_size*0.8, loc='best')
                 
         except Exception as e:
             st.error(f"Error in panel ({r},{c}): {e}")
@@ -398,7 +459,7 @@ def generate_composite_figure(fig_specs, layout_type, width, height, unit, check
         pass # Ignore singular matrix error in layout engine
     except Exception as e:
         print(f"Warning: tight_layout failed: {e}")
-    return fig
+    return fig, report_data
 
 def render_figure_composer(measurements, cache_root):
     # --- Sidebar Dataset Info & Switcher ---
@@ -886,7 +947,7 @@ def render_figure_composer(measurements, cache_root):
             fig_specs[(2,2)] = _render_panel_config(2,2)
 
     # Final Figure Generation
-    fig = generate_composite_figure(
+    fig, quant_report = generate_composite_figure(
         fig_specs, layout_type, w, h, unit, 
         check_dependencies=check_dependencies,
         common_labels=common_labels,
@@ -908,7 +969,30 @@ def render_figure_composer(measurements, cache_root):
     st.divider()
     
     if 'fig_preview' in st.session_state:
-        st.pyplot(st.session_state.fig_preview)
+        st.pyplot(fig)
+        
+        # QUANTITATIVE REPORT
+        if quant_report:
+            with st.expander("📊 Quantitative Symmetry Report", expanded=False):
+                st.markdown(stats.get_metrics_description())
+                
+                df_report = pd.DataFrame(quant_report)
+                
+                # Format for display
+                df_disp = df_report.copy()
+                df_disp["Bias"] = df_disp["Bias"].apply(lambda x: f"{x:+.4f}" if abs(x) < 0.1 else f"{x:+.1%}")
+                df_disp["Match (%)"] = df_disp["Match (%)"].map("{:.2f}%".format)
+                
+                st.dataframe(df_disp, use_container_width=True, hide_index=True)
+                
+                # CSV Download option
+                csv = df_report.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Download Report as CSV",
+                    data=csv,
+                    file_name=f"symmetry_report_{active_seq}.csv",
+                    mime='text/csv',
+                )
         
         # Export Controls
         st.subheader("Export")
@@ -949,7 +1033,7 @@ def render_figure_composer(measurements, cache_root):
                             # 1. Base Figure
                             orig_mc = check_dependencies.get('multi_comparisons', [])
                             check_dependencies['multi_comparisons'] = []
-                            fig_base = generate_composite_figure(
+                            fig_base, quant_report_base = generate_composite_figure(
                                 fig_specs, layout_type, w, h, unit, 
                                 check_dependencies=check_dependencies,
                                 common_labels=common_labels,
@@ -966,7 +1050,7 @@ def render_figure_composer(measurements, cache_root):
 
                             # 2. Symmetric Figure
                             check_dependencies['multi_comparisons'] = orig_mc
-                            fig_sym = generate_composite_figure(
+                            fig_sym, quant_report_sym = generate_composite_figure(
                                 fig_specs, layout_type, w, h, unit, 
                                 check_dependencies=check_dependencies,
                                 common_labels=common_labels,

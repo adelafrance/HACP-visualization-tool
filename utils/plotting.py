@@ -50,28 +50,63 @@ STYLES = {
     "Presentation": FigureStyle(font_family="Arial", font_size=18, background_color="white", grid_color="dimgrey")  
 }
 
-def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True):
+def get_mpl_modified_cmap(base_name="viridis", zero_mode="Default", zero_threshold=None):
+    """Returns a Matplotlib colormap with 0 (or values below threshold) mapped to a specific color."""
+    try:
+        base_cmap = plt.get_cmap(base_name).copy()
+    except:
+        base_cmap = plt.get_cmap("viridis").copy()
+    
+    if zero_mode in ["White", "Black"]:
+        from matplotlib.colors import ListedColormap
+        colors = base_cmap(np.linspace(0, 1, 256))
+        z_color = [1, 1, 1, 1] if zero_mode == "White" else [0, 0, 0, 1]
+        
+        if zero_threshold is not None:
+            # Map the bottom portion of the LUT to the zero color
+            # zero_threshold is assumed to be a fraction [0, 1] of the range
+            num_indices = int(zero_threshold * 256)
+            for i in range(max(1, num_indices)):
+                colors[i] = z_color
+        else:
+            colors[0] = z_color
+        return ListedColormap(colors)
+    return base_cmap
+
+def create_mpl_heatmap(img, ax, cmap='viridis', zmin=None, zmax=None, title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, extent=None, disable_sci_x=False, disable_sci_y=False):
     """Matplotlib Heatmap on a specific Axes."""
     if style is None: style = STYLES["Default"]
     
-    im = ax.imshow(img, cmap=cmap, vmin=zmin, vmax=zmax, aspect='auto')
+    # If cmap is a string, we might need to modify it if the user wants standard 'White' zero
+    # For now, we assume cmap could be a Colormap object already
+    im = ax.imshow(img, cmap=cmap, vmin=zmin, vmax=zmax, aspect='auto', extent=extent)
     
     if title: ax.set_title(title)
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
-    if not show_x: ax.set_xticklabels([])
-    if not show_y: ax.set_yticklabels([])
+    style.apply_to_mpl(ax)
     
-    # Enforce Scientific Notation (only if ScalarFormatter)
+    # Enforce tick visibility and labeling
+    ax.tick_params(axis='x', labelbottom=show_x)
+    ax.tick_params(axis='y', labelleft=show_y)
+
+    # Scientific Notation Logic
     try:
-        ax.ticklabel_format(style='sci', scilimits=(0,0), axis='both')
+        if not disable_sci_x:
+            ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='x', useOffset=False)
+        else:
+            ax.ticklabel_format(style='plain', axis='x', useOffset=False)
+        
+        if not disable_sci_y:
+            ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='y', useOffset=False)
+        else:
+            ax.ticklabel_format(style='plain', axis='y', useOffset=False)
     except (AttributeError, ValueError):
         pass
-    style.apply_to_mpl(ax)
     return im
 
-def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, disable_sci_y=False, linestyle="-", ylim=None, internal_label=None, scale_factor=1.0):
+def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", title="", style=None, xlabel="", ylabel="", show_x=True, show_y=True, y_log=False, disable_sci_x=False, disable_sci_y=False, linestyle="-", ylim=None, internal_label=None, internal_label_loc="top left", scale_factor=1.0, is_comparison=False, y_precision=None, show_legend=True):
     """Matplotlib Line Plot on a specific Axes."""
     if style is None: style = STYLES["Default"]
     
@@ -92,23 +127,28 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
-    # Internal Panel Label (Top Left)
+    # Internal Panel Label
     if internal_label:
-        ax.text(0.02, 0.96, internal_label, transform=ax.transAxes, 
-                verticalalignment='top', fontweight='bold', 
+        lx, ly = 0.02, 0.96
+        ha, va = 'left', 'top'
+        if internal_label_loc == "top right":
+            lx, ly = 0.98, 0.96
+            ha = 'right'
+        
+        ax.text(lx, ly, internal_label, transform=ax.transAxes, 
+                verticalalignment=va, horizontalalignment=ha, fontweight='bold', 
                 fontsize=style.font_size, family=style.font_family,
                 bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1))
 
-    # Handle Axis Visibility vs Tick Visibility
-    if not show_x:
-        ax.tick_params(axis='x', labelbottom=False)
-    
-    if not show_y:
-        ax.tick_params(axis='y', labelleft=False)
+    style.apply_to_mpl(ax)
+
+    # Handle Axis Visibility vs Tick Visibility (Applied LAST to prevent style overrides)
+    if not is_comparison:
+        # Enforce show_x/show_y
+        ax.tick_params(axis='x', labelbottom=show_x)
+        ax.tick_params(axis='y', labelleft=show_y)
 
         # Scientific Notation Logic
-        # User requested to DISABLE default offset behavior (e.g. 1e-1 at top)
-        # We obey the disable_sci flags for the '1eN' conversion, but we ALWAYS disable offset.
         try:
             if not disable_sci_x:
                 ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='x', useOffset=False)
@@ -116,26 +156,48 @@ def create_mpl_line(x_data, y_data, ax, y_err=None, label="Data", color="blue", 
                 ax.ticklabel_format(style='plain', axis='x', useOffset=False)
             
             if not disable_sci_y:
-                # Even if scientific notation is allowed, we ensure it's not "just an offset"
                 ax.ticklabel_format(style='sci', scilimits=(-3,4), axis='y', useOffset=False)
             else:
                 ax.ticklabel_format(style='plain', axis='y', useOffset=False)
         except (AttributeError, ValueError):
-            pass # Log scale or incompatible formatter
+            pass 
         
+        # Enforce Fixed Precision if requested
+        if y_precision is not None:
+            from matplotlib.ticker import FormatStrFormatter
+            ax.yaxis.set_major_formatter(FormatStrFormatter(f'%.{int(y_precision)}f'))
+
+        if show_legend and label:
+             ax.legend(fontsize=style.font_size*0.8, loc='best')
+
     if ylim is not None:
         ax.set_ylim(ylim)
 
-    style.apply_to_mpl(ax)
-
-def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", style=None, xlabel="Intensity", ylabel="Pixel", show_x=True, show_y=True):
-    """Matplotlib Decomposition Plot."""
+def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", style=None, xlabel="Intensity", ylabel="Pixel", show_x=True, show_y=True, internal_label=None, internal_label_loc="top left", show_legend=False, components=None):
+    """Matplotlib Decomposition Plot with selective component rendering."""
     if style is None: style = STYLES["Default"]
     from utils import polarimeter_processing
     
+    # Default to all if not specified
+    if components is None:
+        components = ['raw', 'wall', 'signal', 'total']
+    
     # Raw Data - Note: y_pixels is Y-AXIS, norm_profile is X-AXIS (Vertical Profile)
     # Matplotlib plot(x, y). So plot(norm_profile, y_pixels)
-    ax.plot(norm_profile, y_pixels, label='Raw Data', color='#1f77b4', linewidth=2)
+    if 'raw' in components:
+        ax.plot(norm_profile, y_pixels, label='Raw Data', color='#1f77b4', linewidth=2)
+    
+    if internal_label:
+        lx, ly = 0.02, 0.96
+        ha, va = 'left', 'top'
+        if internal_label_loc == "top right":
+            lx, ly = 0.98, 0.96
+            ha = 'right'
+
+        ax.text(lx, ly, internal_label, transform=ax.transAxes, 
+                verticalalignment=va, horizontalalignment=ha, fontweight='bold', 
+                fontsize=style.font_size, family=style.font_family,
+                bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1))
     
     if popt is not None:
          # Generate curves
@@ -143,13 +205,16 @@ def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", st
         broad_curve = polarimeter_processing.gaussian_func(y_pixels, popt[4], popt[5], popt[6], popt[0])
         total_curve = polarimeter_processing.double_gaussian_func(y_pixels, *popt)
         
-        ax.plot(broad_curve, y_pixels, label='Wall', color='gray', linestyle='--')
-        ax.fill_betweenx(y_pixels, broad_curve, 0, color='gray', alpha=0.2)
+        if 'wall' in components:
+            ax.plot(broad_curve, y_pixels, label='Wall', color='gray', linestyle='--')
+            ax.fill_betweenx(y_pixels, broad_curve, 0, color='gray', alpha=0.2)
         
-        ax.plot(narrow_curve, y_pixels, label='Signal', color='magenta')
-        ax.fill_betweenx(y_pixels, narrow_curve, 0, color='magenta', alpha=0.2)
+        if 'signal' in components:
+            ax.plot(narrow_curve, y_pixels, label='Signal', color='magenta')
+            ax.fill_betweenx(y_pixels, narrow_curve, 0, color='magenta', alpha=0.2)
         
-        ax.plot(total_curve, y_pixels, label='Total Fit', color='black', linestyle=':')
+        if 'total' in components:
+            ax.plot(total_curve, y_pixels, label='Total Fit', color='black', linestyle=':')
         
     ax.invert_yaxis() # Image Coordinates
     
@@ -157,17 +222,49 @@ def create_mpl_decomposition(y_pixels, norm_profile, ax, popt=None, title="", st
     if show_x: ax.set_xlabel(xlabel)
     if show_y: ax.set_ylabel(ylabel)
     
-    if not show_x: ax.set_xticklabels([])
-    if not show_y: ax.set_yticklabels([])
-
-    try:
-        ax.ticklabel_format(style='sci', scilimits=(0,0), axis='both')
-    except (AttributeError, ValueError):
-        pass
     style.apply_to_mpl(ax)
+    
+    # Enforce tick visibility and labeling
+    ax.tick_params(axis='x', labelbottom=show_x)
+    ax.tick_params(axis='y', labelleft=show_y)
+    
+    if show_legend:
+        ax.legend(fontsize=style.font_size*0.8, loc='best')
+
+    return ax
 
 
-def get_modified_colorscale(name, zero_mode):
+def get_mpl_modified_cmap(base_name="viridis", zero_mode="Default", zero_threshold=None):
+    """Returns a Matplotlib colormap with 0 mapped to a specific color or gradient."""
+    try:
+        base_cmap = plt.get_cmap(base_name).copy()
+    except:
+        base_cmap = plt.get_cmap("viridis").copy()
+    
+    if zero_mode in ["White", "Black"]:
+        from matplotlib.colors import ListedColormap
+        # Get the colormapLUT
+        colors = base_cmap(np.linspace(0, 1, 256))
+        z_color = np.array([1, 1, 1, 1]) if zero_mode == "White" else np.array([0, 0, 0, 1])
+        
+        if zero_threshold is not None:
+            # Gradient Transition Logic to mimic Plotly interpolation
+            # We treat zero_threshold as the fraction of the map to blend from z_color to the map's color at that threshold.
+            # E.g. 0.11 means indices 0..28 will be a gradient from White -> colors[28]
+            
+            num_indices = int(zero_threshold * 256)
+            if num_indices > 0:
+                target_color = colors[num_indices] # The color we blend TO
+                
+                for i in range(num_indices):
+                    t = i / float(num_indices) # 0.0 at i=0, 1.0 at i=num
+                    # Linear interpolation: (1-t)*Start + t*End
+                    colors[i] = (1 - t) * z_color + t * target_color
+        else:
+             colors[0] = z_color
+             
+        return ListedColormap(colors)
+    return base_cmap
     """
     Returns a colorscale where 0 is mapped to a specific color (Black/White/Default).
     """
